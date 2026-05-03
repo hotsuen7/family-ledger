@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Plus, Trash2, RefreshCw, Home, PieChart, ArrowLeftRight, X, Check, UserPlus, Sparkles, Share2 } from 'lucide-react';
+import { Plus, Trash2, RefreshCw, Home, PieChart, ArrowLeftRight, X, Check, UserPlus, Sparkles, Share2, HandCoins, History, Search, SlidersHorizontal } from 'lucide-react';
 import { loadData, saveData, subscribeToChanges, familyId } from './firebase.js';
 
-// 分類設定
 const CATEGORIES = {
   expense: [
     { id: 'food', name: '飲食', emoji: '🍜', color: '#E8956C' },
@@ -23,6 +22,8 @@ const CATEGORIES = {
   ],
 };
 
+const ALL_CATS = [...CATEGORIES.expense, ...CATEGORIES.income];
+
 const formatMoney = (n) => {
   const num = Number(n) || 0;
   return num.toLocaleString('zh-TW', { maximumFractionDigits: 0 });
@@ -31,6 +32,11 @@ const formatMoney = (n) => {
 const formatDate = (iso) => {
   const d = new Date(iso);
   return `${d.getMonth() + 1}/${d.getDate()}`;
+};
+
+const formatFullDate = (iso) => {
+  const d = new Date(iso);
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
 };
 
 const monthKey = (iso) => {
@@ -43,6 +49,20 @@ const currentMonthLabel = () => {
   return `${d.getFullYear()} 年 ${d.getMonth() + 1} 月`;
 };
 
+// 把日期字串(YYYY-MM-DD)變成那天 00:00:00 或 23:59:59 的 ISO
+const startOfDay = (dateStr) => {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  d.setHours(0, 0, 0, 0);
+  return d;
+};
+const endOfDay = (dateStr) => {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  d.setHours(23, 59, 59, 999);
+  return d;
+};
+
 export default function App() {
   const [members, setMembers] = useState([]);
   const [txns, setTxns] = useState([]);
@@ -52,8 +72,21 @@ export default function App() {
   const [showAdd, setShowAdd] = useState(false);
   const [showAddMember, setShowAddMember] = useState(false);
   const [showShare, setShowShare] = useState(false);
+  const [showSettle, setShowSettle] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+  const [presetSettle, setPresetSettle] = useState(null);
 
-  // 啟動時載入並開始即時同步
+  // 搜尋條件
+  const [searchKeyword, setSearchKeyword] = useState('');
+  const [filterType, setFilterType] = useState('all'); // all/expense/income/settlement
+  const [filterCats, setFilterCats] = useState([]); // 選中的分類 id 陣列
+  const [filterPayerIds, setFilterPayerIds] = useState([]); // 選中的付款人 id 陣列
+  const [filterDateFrom, setFilterDateFrom] = useState('');
+  const [filterDateTo, setFilterDateTo] = useState('');
+  const [filterAmountMin, setFilterAmountMin] = useState('');
+  const [filterAmountMax, setFilterAmountMax] = useState('');
+
   useEffect(() => {
     let unsub = null;
     (async () => {
@@ -61,8 +94,6 @@ export default function App() {
       setMembers(data.members);
       setTxns(data.txns);
       setLoading(false);
-
-      // 訂閱即時更新:其他家人改了什麼,我這邊自動同步
       unsub = subscribeToChanges((data) => {
         setMembers(data.members);
         setTxns(data.txns);
@@ -87,7 +118,7 @@ export default function App() {
   };
 
   const removeMember = async (id) => {
-    if (txns.some(t => t.payerId === id || (t.shareIds && t.shareIds.includes(id)))) {
+    if (txns.some(t => t.payerId === id || (t.shareIds && t.shareIds.includes(id)) || t.fromId === id || t.toId === id)) {
       alert('此成員有相關交易紀錄,無法刪除');
       return;
     }
@@ -102,11 +133,108 @@ export default function App() {
     await saveData(members, newTxns);
   };
 
+  const addMultipleTxns = async (newOnes) => {
+    const stamped = newOnes.map((t, i) => ({ ...t, id: (Date.now() + i).toString() }));
+    const newTxns = [...stamped, ...txns];
+    setTxns(newTxns);
+    await saveData(members, newTxns);
+  };
+
   const removeTxn = async (id) => {
     const newTxns = txns.filter(t => t.id !== id);
     setTxns(newTxns);
     await saveData(members, newTxns);
   };
+
+  // 是否處於搜尋模式(任一條件被啟用)
+  const isSearching = useMemo(() => {
+    return searchKeyword.trim() !== '' ||
+      filterType !== 'all' ||
+      filterCats.length > 0 ||
+      filterPayerIds.length > 0 ||
+      filterDateFrom !== '' ||
+      filterDateTo !== '' ||
+      filterAmountMin !== '' ||
+      filterAmountMax !== '';
+  }, [searchKeyword, filterType, filterCats, filterPayerIds, filterDateFrom, filterDateTo, filterAmountMin, filterAmountMax]);
+
+  const clearSearch = () => {
+    setSearchKeyword('');
+    setFilterType('all');
+    setFilterCats([]);
+    setFilterPayerIds([]);
+    setFilterDateFrom('');
+    setFilterDateTo('');
+    setFilterAmountMin('');
+    setFilterAmountMax('');
+  };
+
+  // 套用搜尋條件後的記錄
+  const filteredTxns = useMemo(() => {
+    if (!isSearching) return null;
+
+    const kw = searchKeyword.trim().toLowerCase();
+    const dFrom = startOfDay(filterDateFrom);
+    const dTo = endOfDay(filterDateTo);
+    const minA = filterAmountMin === '' ? null : Number(filterAmountMin);
+    const maxA = filterAmountMax === '' ? null : Number(filterAmountMax);
+
+    return txns.filter(t => {
+      // 類型篩選
+      if (filterType !== 'all' && t.type !== filterType) return false;
+
+      // 分類篩選(只對 expense / income 有效;settlement 沒分類所以排除掉)
+      if (filterCats.length > 0) {
+        if (t.type === 'settlement') return false;
+        if (!filterCats.includes(t.category)) return false;
+      }
+
+      // 付款人篩選(對 expense/income 看 payerId,對 settlement 看 fromId)
+      if (filterPayerIds.length > 0) {
+        const candidate = t.type === 'settlement' ? t.fromId : t.payerId;
+        if (!filterPayerIds.includes(candidate)) return false;
+      }
+
+      // 日期篩選
+      const td = new Date(t.date);
+      if (dFrom && td < dFrom) return false;
+      if (dTo && td > dTo) return false;
+
+      // 金額篩選
+      const amt = Number(t.amount);
+      if (minA !== null && amt < minA) return false;
+      if (maxA !== null && amt > maxA) return false;
+
+      // 關鍵字(備註 + 金額 + 分類名稱)
+      if (kw) {
+        const cat = ALL_CATS.find(c => c.id === t.category);
+        const payer = members.find(m => m.id === (t.payerId || t.fromId));
+        const target = members.find(m => m.id === t.toId);
+        const haystack = [
+          t.note || '',
+          String(t.amount),
+          cat?.name || '',
+          payer?.name || '',
+          target?.name || '',
+          t.type === 'settlement' ? '還款' : '',
+        ].join(' ').toLowerCase();
+        if (!haystack.includes(kw)) return false;
+      }
+
+      return true;
+    });
+  }, [isSearching, txns, searchKeyword, filterType, filterCats, filterPayerIds, filterDateFrom, filterDateTo, filterAmountMin, filterAmountMax, members]);
+
+  // 搜尋結果統計
+  const searchStats = useMemo(() => {
+    if (!filteredTxns) return null;
+    let income = 0, expense = 0;
+    filteredTxns.forEach(t => {
+      if (t.type === 'income') income += Number(t.amount);
+      else if (t.type === 'expense') expense += Number(t.amount);
+    });
+    return { count: filteredTxns.length, income, expense, net: income - expense };
+  }, [filteredTxns]);
 
   const thisMonth = monthKey(new Date().toISOString());
   const monthTxns = useMemo(() => txns.filter(t => monthKey(t.date) === thisMonth), [txns, thisMonth]);
@@ -117,7 +245,7 @@ export default function App() {
     monthTxns.forEach(t => {
       if (t.type === 'income') {
         income += Number(t.amount);
-      } else {
+      } else if (t.type === 'expense') {
         expense += Number(t.amount);
         catMap[t.category] = (catMap[t.category] || 0) + Number(t.amount);
       }
@@ -137,13 +265,18 @@ export default function App() {
     members.forEach(m => { balances[m.id] = 0; });
 
     txns.forEach(t => {
-      if (t.type !== 'expense' || !t.shareIds || t.shareIds.length === 0) return;
-      const amt = Number(t.amount);
-      const share = amt / t.shareIds.length;
-      if (balances[t.payerId] !== undefined) balances[t.payerId] += amt;
-      t.shareIds.forEach(sid => {
-        if (balances[sid] !== undefined) balances[sid] -= share;
-      });
+      if (t.type === 'expense' && t.shareIds && t.shareIds.length > 0) {
+        const amt = Number(t.amount);
+        const share = amt / t.shareIds.length;
+        if (balances[t.payerId] !== undefined) balances[t.payerId] += amt;
+        t.shareIds.forEach(sid => {
+          if (balances[sid] !== undefined) balances[sid] -= share;
+        });
+      } else if (t.type === 'settlement') {
+        const amt = Number(t.amount);
+        if (balances[t.fromId] !== undefined) balances[t.fromId] += amt;
+        if (balances[t.toId] !== undefined) balances[t.toId] -= amt;
+      }
     });
 
     const debtors = [];
@@ -158,13 +291,15 @@ export default function App() {
     debtors.sort((a, b) => b.amount - a.amount);
     creditors.sort((a, b) => b.amount - a.amount);
 
+    const dCopy = debtors.map(d => ({ ...d }));
+    const cCopy = creditors.map(c => ({ ...c }));
     const transfers = [];
     let i = 0, j = 0;
-    while (i < debtors.length && j < creditors.length) {
-      const d = debtors[i];
-      const c = creditors[j];
+    while (i < dCopy.length && j < cCopy.length) {
+      const d = dCopy[i];
+      const c = cCopy[j];
       const amt = Math.min(d.amount, c.amount);
-      if (amt > 0.5) transfers.push({ from: d.name, to: c.name, amount: amt });
+      if (amt > 0.5) transfers.push({ fromId: d.id, from: d.name, toId: c.id, to: c.name, amount: amt });
       d.amount -= amt;
       c.amount -= amt;
       if (d.amount < 0.5) i++;
@@ -173,6 +308,12 @@ export default function App() {
 
     return { balances, transfers };
   }, [txns, members]);
+
+  const settlementHistory = useMemo(() => {
+    return txns
+      .filter(t => t.type === 'settlement')
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [txns]);
 
   if (loading) {
     return (
@@ -197,6 +338,16 @@ export default function App() {
             </div>
           </div>
           <div className="header-actions">
+            {tab === 'home' && (
+              <button
+                onClick={() => setShowSearch(!showSearch)}
+                className={`sync-btn ${showSearch || isSearching ? 'active' : ''}`}
+                title="搜尋"
+              >
+                <Search size={16} />
+                {isSearching && <span className="search-dot" />}
+              </button>
+            )}
             <button onClick={() => setShowShare(true)} className="sync-btn" title="分享給家人">
               <Share2 size={16} />
             </button>
@@ -209,15 +360,62 @@ export default function App() {
 
       <main className="ledger-main">
         {tab === 'home' && (
-          <HomeTab stats={stats} txns={txns} monthTxns={monthTxns} members={members} onDelete={removeTxn} />
+          <>
+            {showSearch && (
+              <SearchPanel
+                members={members}
+                searchKeyword={searchKeyword} setSearchKeyword={setSearchKeyword}
+                filterType={filterType} setFilterType={setFilterType}
+                filterCats={filterCats} setFilterCats={setFilterCats}
+                filterPayerIds={filterPayerIds} setFilterPayerIds={setFilterPayerIds}
+                filterDateFrom={filterDateFrom} setFilterDateFrom={setFilterDateFrom}
+                filterDateTo={filterDateTo} setFilterDateTo={setFilterDateTo}
+                filterAmountMin={filterAmountMin} setFilterAmountMin={setFilterAmountMin}
+                filterAmountMax={filterAmountMax} setFilterAmountMax={setFilterAmountMax}
+                isSearching={isSearching}
+                onClear={clearSearch}
+                onClose={() => setShowSearch(false)}
+              />
+            )}
+            {isSearching ? (
+              <SearchResultTab
+                filteredTxns={filteredTxns}
+                searchStats={searchStats}
+                members={members}
+                onDelete={removeTxn}
+                onClearSearch={clearSearch}
+              />
+            ) : (
+              <HomeTab stats={stats} txns={txns} monthTxns={monthTxns} members={members} onDelete={removeTxn} />
+            )}
+          </>
         )}
         {tab === 'stats' && <StatsTab stats={stats} monthTxns={monthTxns} />}
         {tab === 'split' && (
           <SplitTab
             members={members}
             settlement={settlement}
+            settlementHistory={settlementHistory}
             onAddMember={() => setShowAddMember(true)}
             onRemoveMember={removeMember}
+            onSettleOne={(transfer) => {
+              setPresetSettle(transfer);
+              setShowSettle(true);
+            }}
+            onSettleAll={async () => {
+              if (settlement.transfers.length === 0) return;
+              if (!confirm(`確定要一次結清所有款項?將會自動建立 ${settlement.transfers.length} 筆還款記錄。`)) return;
+              const newOnes = settlement.transfers.map(t => ({
+                type: 'settlement',
+                amount: t.amount,
+                fromId: t.fromId,
+                toId: t.toId,
+                note: '一鍵結清',
+                date: new Date().toISOString(),
+              }));
+              await addMultipleTxns(newOnes);
+            }}
+            onShowHistory={() => setShowHistory(true)}
           />
         )}
       </main>
@@ -260,21 +458,295 @@ export default function App() {
       )}
 
       {showShare && <ShareModal onClose={() => setShowShare(false)} />}
+
+      {showSettle && (
+        <SettleModal
+          members={members}
+          preset={presetSettle}
+          onClose={() => { setShowSettle(false); setPresetSettle(null); }}
+          onSubmit={async (txn) => {
+            await addTxn(txn);
+            setShowSettle(false);
+            setPresetSettle(null);
+          }}
+        />
+      )}
+
+      {showHistory && (
+        <HistoryModal
+          history={settlementHistory}
+          members={members}
+          onClose={() => setShowHistory(false)}
+          onDelete={removeTxn}
+        />
+      )}
     </div>
   );
 }
 
-// 分享 Modal:讓家人加入同一本帳
+// 搜尋面板
+function SearchPanel({
+  members,
+  searchKeyword, setSearchKeyword,
+  filterType, setFilterType,
+  filterCats, setFilterCats,
+  filterPayerIds, setFilterPayerIds,
+  filterDateFrom, setFilterDateFrom,
+  filterDateTo, setFilterDateTo,
+  filterAmountMin, setFilterAmountMin,
+  filterAmountMax, setFilterAmountMax,
+  isSearching, onClear, onClose,
+}) {
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  const toggleCat = (id) => {
+    setFilterCats(filterCats.includes(id) ? filterCats.filter(x => x !== id) : [...filterCats, id]);
+  };
+  const togglePayer = (id) => {
+    setFilterPayerIds(filterPayerIds.includes(id) ? filterPayerIds.filter(x => x !== id) : [...filterPayerIds, id]);
+  };
+
+  // 快速日期捷徑
+  const setQuickDate = (kind) => {
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    if (kind === 'thismonth') {
+      const start = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
+      setFilterDateFrom(start);
+      setFilterDateTo(today);
+    } else if (kind === 'lastmonth') {
+      const start = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString().slice(0, 10);
+      const end = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().slice(0, 10);
+      setFilterDateFrom(start);
+      setFilterDateTo(end);
+    } else if (kind === 'last7') {
+      const d = new Date(); d.setDate(d.getDate() - 6);
+      setFilterDateFrom(d.toISOString().slice(0, 10));
+      setFilterDateTo(today);
+    } else if (kind === 'last30') {
+      const d = new Date(); d.setDate(d.getDate() - 29);
+      setFilterDateFrom(d.toISOString().slice(0, 10));
+      setFilterDateTo(today);
+    }
+  };
+
+  return (
+    <div className="search-panel">
+      <div className="search-input-wrap">
+        <Search size={16} className="search-icon" />
+        <input
+          type="text"
+          className="search-input"
+          placeholder="搜尋備註、金額、分類..."
+          value={searchKeyword}
+          onChange={e => setSearchKeyword(e.target.value)}
+          autoFocus
+        />
+        {searchKeyword && (
+          <button className="search-clear" onClick={() => setSearchKeyword('')}>
+            <X size={14} />
+          </button>
+        )}
+      </div>
+
+      {/* 類型快速篩選 */}
+      <div className="search-row">
+        <div className="filter-chips">
+          <button className={`filter-chip ${filterType === 'all' ? 'active' : ''}`} onClick={() => setFilterType('all')}>全部</button>
+          <button className={`filter-chip ${filterType === 'expense' ? 'active' : ''}`} onClick={() => setFilterType('expense')}>支出</button>
+          <button className={`filter-chip ${filterType === 'income' ? 'active' : ''}`} onClick={() => setFilterType('income')}>收入</button>
+          <button className={`filter-chip ${filterType === 'settlement' ? 'active' : ''}`} onClick={() => setFilterType('settlement')}>還款</button>
+        </div>
+        <button className={`adv-toggle ${showAdvanced ? 'active' : ''}`} onClick={() => setShowAdvanced(!showAdvanced)}>
+          <SlidersHorizontal size={14} />
+          進階
+        </button>
+      </div>
+
+      {showAdvanced && (
+        <div className="advanced-filters">
+          {/* 分類 */}
+          {(filterType === 'all' || filterType === 'expense' || filterType === 'income') && (
+            <div className="filter-group">
+              <div className="filter-label">分類</div>
+              <div className="filter-cat-grid">
+                {(filterType === 'income' ? CATEGORIES.income : filterType === 'expense' ? CATEGORIES.expense : ALL_CATS).map(c => (
+                  <button
+                    key={c.id}
+                    className={`filter-cat-chip ${filterCats.includes(c.id) ? 'active' : ''}`}
+                    onClick={() => toggleCat(c.id)}
+                    style={filterCats.includes(c.id) ? { background: c.color, borderColor: c.color, color: 'white' } : {}}
+                  >
+                    <span>{c.emoji}</span>
+                    <span>{c.name}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 付款人 / 還款人 */}
+          {members.length > 0 && (
+            <div className="filter-group">
+              <div className="filter-label">{filterType === 'settlement' ? '還款人' : '付款人'}</div>
+              <div className="filter-payer-row">
+                {members.map(m => (
+                  <button
+                    key={m.id}
+                    className={`filter-payer-chip ${filterPayerIds.includes(m.id) ? 'active' : ''}`}
+                    onClick={() => togglePayer(m.id)}
+                  >
+                    {m.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 日期 */}
+          <div className="filter-group">
+            <div className="filter-label">日期範圍</div>
+            <div className="filter-quick-date">
+              <button className="quick-date-btn" onClick={() => setQuickDate('thismonth')}>本月</button>
+              <button className="quick-date-btn" onClick={() => setQuickDate('lastmonth')}>上月</button>
+              <button className="quick-date-btn" onClick={() => setQuickDate('last7')}>近 7 天</button>
+              <button className="quick-date-btn" onClick={() => setQuickDate('last30')}>近 30 天</button>
+            </div>
+            <div className="filter-date-row">
+              <input type="date" className="filter-date-input" value={filterDateFrom} onChange={e => setFilterDateFrom(e.target.value)} placeholder="從" />
+              <span className="filter-date-sep">至</span>
+              <input type="date" className="filter-date-input" value={filterDateTo} onChange={e => setFilterDateTo(e.target.value)} placeholder="到" />
+            </div>
+          </div>
+
+          {/* 金額 */}
+          <div className="filter-group">
+            <div className="filter-label">金額範圍</div>
+            <div className="filter-amount-row">
+              <input type="number" className="filter-amount-input" placeholder="最小" value={filterAmountMin} onChange={e => setFilterAmountMin(e.target.value)} inputMode="decimal" />
+              <span className="filter-date-sep">至</span>
+              <input type="number" className="filter-amount-input" placeholder="最大" value={filterAmountMax} onChange={e => setFilterAmountMax(e.target.value)} inputMode="decimal" />
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="search-actions">
+        {isSearching && (
+          <button className="search-clear-btn" onClick={onClear}>
+            <X size={14} />
+            清除條件
+          </button>
+        )}
+        <button className="search-close-btn" onClick={onClose}>收起</button>
+      </div>
+    </div>
+  );
+}
+
+// 搜尋結果頁
+function SearchResultTab({ filteredTxns, searchStats, members, onDelete, onClearSearch }) {
+  return (
+    <div className="tab-search-result">
+      <div className="result-summary">
+        <div className="result-count">
+          找到 <strong>{searchStats.count}</strong> 筆記錄
+        </div>
+        {(searchStats.income > 0 || searchStats.expense > 0) && (
+          <div className="result-stats">
+            {searchStats.income > 0 && (
+              <span className="result-stat income">收入 +{formatMoney(searchStats.income)}</span>
+            )}
+            {searchStats.expense > 0 && (
+              <span className="result-stat expense">支出 -{formatMoney(searchStats.expense)}</span>
+            )}
+            {searchStats.income > 0 && searchStats.expense > 0 && (
+              <span className={`result-stat net ${searchStats.net < 0 ? 'neg' : ''}`}>
+                淨額 {searchStats.net >= 0 ? '+' : ''}{formatMoney(searchStats.net)}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {filteredTxns.length === 0 ? (
+        <div className="empty">
+          <div className="empty-emoji">🔍</div>
+          <div className="empty-text">沒有符合的記錄</div>
+          <div className="empty-hint">試著放寬篩選條件</div>
+          <button className="empty-btn" onClick={onClearSearch}>清除條件</button>
+        </div>
+      ) : (
+        <div className="txn-list">
+          {filteredTxns.map(t => {
+            if (t.type === 'settlement') {
+              const from = members.find(m => m.id === t.fromId);
+              const to = members.find(m => m.id === t.toId);
+              return (
+                <div key={t.id} className="txn-item">
+                  <div className="txn-icon settle-icon"><HandCoins size={18} /></div>
+                  <div className="txn-mid">
+                    <div className="txn-top">
+                      <span className="txn-cat">還款</span>
+                      <span className="txn-note"> · {from?.name || '?'} → {to?.name || '?'}</span>
+                    </div>
+                    <div className="txn-meta">
+                      {formatFullDate(t.date)}
+                      {t.note && <span> · {t.note}</span>}
+                    </div>
+                  </div>
+                  <div className="txn-right">
+                    <div className="txn-amt settle">↻ {formatMoney(t.amount)}</div>
+                    <button className="txn-del" onClick={() => { if (confirm('刪除這筆還款記錄?')) onDelete(t.id); }}>
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </div>
+              );
+            }
+            const cat = ALL_CATS.find(c => c.id === t.category);
+            const payer = members.find(m => m.id === t.payerId);
+            return (
+              <div key={t.id} className="txn-item">
+                <div className="txn-icon" style={{ background: (cat?.color || '#999') + '22', color: cat?.color || '#999' }}>
+                  {cat?.emoji || '📝'}
+                </div>
+                <div className="txn-mid">
+                  <div className="txn-top">
+                    <span className="txn-cat">{cat?.name || '其他'}</span>
+                    {t.note && <span className="txn-note">· {t.note}</span>}
+                  </div>
+                  <div className="txn-meta">
+                    {formatFullDate(t.date)}
+                    {payer && <span> · {payer.name} 付</span>}
+                    {t.shareIds && t.shareIds.length > 1 && <span> · {t.shareIds.length} 人分</span>}
+                  </div>
+                </div>
+                <div className="txn-right">
+                  <div className={`txn-amt ${t.type}`}>
+                    {t.type === 'income' ? '+' : '-'}{formatMoney(t.amount)}
+                  </div>
+                  <button className="txn-del" onClick={() => { if (confirm('確定要刪除這筆記錄?')) onDelete(t.id); }}>
+                    <Trash2 size={14} />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ShareModal({ onClose }) {
   const url = window.location.href;
   const [copied, setCopied] = useState(false);
-
   const copy = () => {
     navigator.clipboard.writeText(url);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
-
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal modal-small" onClick={e => e.stopPropagation()}>
@@ -296,7 +768,6 @@ function ShareModal({ onClose }) {
   );
 }
 
-// 首頁
 function HomeTab({ stats, monthTxns, members, onDelete }) {
   const recent = monthTxns.slice(0, 50);
   return (
@@ -334,6 +805,32 @@ function HomeTab({ stats, monthTxns, members, onDelete }) {
         ) : (
           <div className="txn-list">
             {recent.map(t => {
+              if (t.type === 'settlement') {
+                const from = members.find(m => m.id === t.fromId);
+                const to = members.find(m => m.id === t.toId);
+                return (
+                  <div key={t.id} className="txn-item">
+                    <div className="txn-icon settle-icon"><HandCoins size={18} /></div>
+                    <div className="txn-mid">
+                      <div className="txn-top">
+                        <span className="txn-cat">還款</span>
+                        <span className="txn-note"> · {from?.name || '?'} → {to?.name || '?'}</span>
+                      </div>
+                      <div className="txn-meta">
+                        {formatDate(t.date)}
+                        {t.note && <span> · {t.note}</span>}
+                      </div>
+                    </div>
+                    <div className="txn-right">
+                      <div className="txn-amt settle">↻ {formatMoney(t.amount)}</div>
+                      <button className="txn-del" onClick={() => { if (confirm('刪除這筆還款記錄?分帳會回到還沒還的狀態。')) onDelete(t.id); }}>
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+
               const cat = (t.type === 'expense' ? CATEGORIES.expense : CATEGORIES.income).find(c => c.id === t.category);
               const payer = members.find(m => m.id === t.payerId);
               return (
@@ -372,13 +869,14 @@ function HomeTab({ stats, monthTxns, members, onDelete }) {
 
 function StatsTab({ stats, monthTxns }) {
   const totalExp = stats.expense || 1;
+  const expenseCount = monthTxns.filter(t => t.type === 'expense').length;
   return (
     <div className="tab-stats">
       <div className="stats-summary">
         <div className="stats-big">
           <div className="stats-label">本月支出</div>
           <div className="stats-num">NT$ {formatMoney(stats.expense)}</div>
-          <div className="stats-meta">{monthTxns.filter(t => t.type === 'expense').length} 筆消費</div>
+          <div className="stats-meta">{expenseCount} 筆消費</div>
         </div>
       </div>
       <div className="section">
@@ -419,7 +917,7 @@ function StatsTab({ stats, monthTxns }) {
   );
 }
 
-function SplitTab({ members, settlement, onAddMember, onRemoveMember }) {
+function SplitTab({ members, settlement, settlementHistory, onAddMember, onRemoveMember, onSettleOne, onSettleAll, onShowHistory }) {
   return (
     <div className="tab-split">
       <div className="section">
@@ -454,11 +952,17 @@ function SplitTab({ members, settlement, onAddMember, onRemoveMember }) {
           </div>
         )}
       </div>
+
       {members.length > 0 && (
         <div className="section">
           <div className="section-head">
-            <div className="section-title">建議結算</div>
-            <Sparkles size={14} className="section-deco" />
+            <div className="section-title">待結算款項</div>
+            {settlement.transfers.length > 1 && (
+              <button className="head-action" onClick={onSettleAll}>
+                <Sparkles size={14} />
+                一鍵結清
+              </button>
+            )}
           </div>
           {settlement.transfers.length === 0 ? (
             <div className="empty empty-mini">
@@ -468,19 +972,174 @@ function SplitTab({ members, settlement, onAddMember, onRemoveMember }) {
           ) : (
             <div className="transfer-list">
               {settlement.transfers.map((t, i) => (
-                <div key={i} className="transfer-item">
-                  <div className="transfer-from">{t.from}</div>
-                  <div className="transfer-arrow">
-                    <div className="arrow-line" />
-                    <div className="arrow-amt">NT$ {formatMoney(t.amount)}</div>
+                <div key={i} className="transfer-card">
+                  <div className="transfer-row">
+                    <div className="transfer-from">{t.from}</div>
+                    <div className="transfer-arrow">
+                      <div className="arrow-line" />
+                      <div className="arrow-amt">NT$ {formatMoney(t.amount)}</div>
+                    </div>
+                    <div className="transfer-to">{t.to}</div>
                   </div>
-                  <div className="transfer-to">{t.to}</div>
+                  <button className="settle-btn" onClick={() => onSettleOne(t)}>
+                    <HandCoins size={14} />
+                    記錄已還款
+                  </button>
                 </div>
               ))}
             </div>
           )}
         </div>
       )}
+
+      {settlementHistory.length > 0 && (
+        <div className="section">
+          <button className="history-btn" onClick={onShowHistory}>
+            <History size={16} />
+            <span>查看還款記錄 ({settlementHistory.length})</span>
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SettleModal({ members, preset, onClose, onSubmit }) {
+  const [fromId, setFromId] = useState(preset?.fromId || members[0]?.id || '');
+  const [toId, setToId] = useState(preset?.toId || members[1]?.id || members[0]?.id || '');
+  const [amount, setAmount] = useState(preset?.amount ? Math.round(preset.amount).toString() : '');
+  const [note, setNote] = useState('');
+  const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+
+  const submit = () => {
+    const amt = Number(amount);
+    if (!amt || amt <= 0) { alert('請輸入金額'); return; }
+    if (!fromId || !toId) { alert('請選擇還款人和收款人'); return; }
+    if (fromId === toId) { alert('還款人和收款人不能是同一人'); return; }
+    onSubmit({
+      type: 'settlement',
+      amount: amt,
+      fromId, toId,
+      note: note.trim(),
+      date: new Date(date).toISOString(),
+    });
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title">記錄還款</div>
+          <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="modal-body">
+          <div className="settle-hint">
+            <HandCoins size={16} />
+            <span>誰把錢還給誰?這會自動更新分帳結算。</span>
+          </div>
+
+          <div className="field">
+            <label className="field-label">還款人(付錢的)</label>
+            <div className="payer-row">
+              {members.map(m => (
+                <button key={m.id} className={`payer-btn ${fromId === m.id ? 'active' : ''}`} onClick={() => setFromId(m.id)}>
+                  {m.name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="field">
+            <label className="field-label">收款人(收錢的)</label>
+            <div className="payer-row">
+              {members.map(m => (
+                <button key={m.id}
+                  className={`payer-btn ${toId === m.id ? 'active green' : ''}`}
+                  onClick={() => setToId(m.id)}
+                  disabled={m.id === fromId}
+                  style={m.id === fromId ? { opacity: 0.3 } : {}}>
+                  {m.name}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="field">
+            <label className="field-label">金額</label>
+            <div className="amount-input">
+              <span className="amount-prefix">NT$</span>
+              <input type="number" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0" inputMode="decimal" autoFocus={!preset} />
+            </div>
+          </div>
+
+          <div className="field">
+            <label className="field-label">日期</label>
+            <input type="date" className="date-input" value={date} onChange={e => setDate(e.target.value)} />
+          </div>
+
+          <div className="field">
+            <label className="field-label">備註(選填)</label>
+            <input type="text" className="note-input" value={note} onChange={e => setNote(e.target.value)} placeholder="例如:現金、轉帳..." maxLength={30} />
+          </div>
+        </div>
+        <div className="modal-foot">
+          <button className="btn-cancel" onClick={onClose}>取消</button>
+          <button className="btn-submit" onClick={submit}>確認還款</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HistoryModal({ history, members, onClose, onDelete }) {
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title">還款記錄</div>
+          <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="modal-body">
+          {history.length === 0 ? (
+            <div className="empty">
+              <div className="empty-emoji">📭</div>
+              <div className="empty-text">還沒有還款記錄</div>
+            </div>
+          ) : (
+            <div className="history-list">
+              {history.map(t => {
+                const from = members.find(m => m.id === t.fromId);
+                const to = members.find(m => m.id === t.toId);
+                return (
+                  <div key={t.id} className="history-item">
+                    <div className="history-icon"><HandCoins size={16} /></div>
+                    <div className="history-mid">
+                      <div className="history-top">
+                        <span className="history-from">{from?.name || '?'}</span>
+                        <span className="history-arrow">→</span>
+                        <span className="history-to">{to?.name || '?'}</span>
+                      </div>
+                      <div className="history-meta">
+                        {formatFullDate(t.date)}
+                        {t.note && <span> · {t.note}</span>}
+                      </div>
+                    </div>
+                    <div className="history-right">
+                      <div className="history-amt">NT$ {formatMoney(t.amount)}</div>
+                      <button className="txn-del visible" onClick={() => { if (confirm('刪除這筆還款記錄?分帳會回到還沒還的狀態。')) onDelete(t.id); }}>
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        <div className="modal-foot">
+          <button className="btn-submit btn-full" onClick={onClose}>關閉</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -665,7 +1324,7 @@ const styles = `
     --ink: #2B2520; --ink-soft: #6B5F55; --ink-mute: #A89B8E;
     --line: #E8DFD2; --line-soft: #F0E8DA;
     --accent: #C97B3F; --accent-soft: #E8956C;
-    --green: #7AA095; --red: #B85C5C;
+    --green: #7AA095; --red: #B85C5C; --blue: #6B8FB5;
     --shadow-sm: 0 1px 2px rgba(78, 60, 42, 0.06);
     --shadow-md: 0 4px 14px rgba(78, 60, 42, 0.08);
     --shadow-lg: 0 12px 32px rgba(78, 60, 42, 0.14);
@@ -681,7 +1340,6 @@ const styles = `
     color: var(--ink); -webkit-font-smoothing: antialiased;
     padding-bottom: 110px; position: relative;
   }
-
   .ledger-app::before {
     content: ''; position: fixed; inset: 0;
     background-image:
@@ -690,57 +1348,158 @@ const styles = `
     pointer-events: none; z-index: 0;
   }
 
-  .ledger-loading {
-    min-height: 100vh; display: grid; place-items: center;
-    background: var(--bg); font-family: 'Noto Serif TC', serif; color: var(--ink-soft);
-  }
+  .ledger-loading { min-height: 100vh; display: grid; place-items: center; background: var(--bg); font-family: 'Noto Serif TC', serif; color: var(--ink-soft); }
   .loading-glow { font-size: 16px; letter-spacing: 0.1em; animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
 
-  .ledger-header {
-    position: sticky; top: 0; z-index: 10;
-    background: rgba(250, 246, 240, 0.92); backdrop-filter: blur(12px);
-    border-bottom: 1px solid var(--line);
-  }
-  .header-inner {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 18px; max-width: 600px; margin: 0 auto;
-  }
+  .ledger-header { position: sticky; top: 0; z-index: 10; background: rgba(250, 246, 240, 0.92); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line); }
+  .header-inner { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; max-width: 600px; margin: 0 auto; }
   .header-actions { display: flex; gap: 8px; }
   .brand { display: flex; align-items: center; gap: 12px; }
-  .brand-mark {
-    width: 38px; height: 38px; border-radius: 11px;
-    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-soft) 100%);
-    color: white; display: grid; place-items: center;
-    font-family: 'Noto Serif TC', serif; font-weight: 700; font-size: 18px;
-    box-shadow: var(--shadow-sm);
-  }
+  .brand-mark { width: 38px; height: 38px; border-radius: 11px; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-soft) 100%); color: white; display: grid; place-items: center; font-family: 'Noto Serif TC', serif; font-weight: 700; font-size: 18px; box-shadow: var(--shadow-sm); }
   .brand-title { font-family: 'Noto Serif TC', serif; font-weight: 700; font-size: 16px; color: var(--ink); line-height: 1.2; }
   .brand-sub { font-size: 11px; color: var(--ink-mute); letter-spacing: 0.05em; margin-top: 2px; }
-  .sync-btn {
-    width: 36px; height: 36px; border-radius: 50%;
-    border: 1px solid var(--line); background: var(--paper);
-    color: var(--ink-soft); cursor: pointer; display: grid; place-items: center;
-    transition: all 0.2s;
-  }
-  .sync-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .sync-btn { width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--line); background: var(--paper); color: var(--ink-soft); cursor: pointer; display: grid; place-items: center; transition: all 0.2s; position: relative; }
+  .sync-btn:hover, .sync-btn.active { border-color: var(--accent); color: var(--accent); }
   .sync-btn.syncing svg { animation: spin 0.6s linear; }
   @keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+  .search-dot { position: absolute; top: 4px; right: 4px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); border: 2px solid var(--paper); }
 
   .ledger-main { max-width: 600px; margin: 0 auto; padding: 20px 18px; position: relative; z-index: 1; }
 
-  .balance-card {
-    position: relative; background: linear-gradient(135deg, #2B2520 0%, #3D2F22 100%);
-    border-radius: var(--r-lg); padding: 28px 24px; color: #F5EFE5;
-    overflow: hidden; box-shadow: var(--shadow-md); margin-bottom: 28px;
+  /* === SEARCH PANEL === */
+  .search-panel {
+    background: var(--paper);
+    border-radius: var(--r-md);
+    padding: 14px;
+    margin-bottom: 18px;
+    box-shadow: var(--shadow-md);
+    border: 1px solid var(--line-soft);
+    animation: slideDown 0.25s cubic-bezier(0.16, 1, 0.3, 1);
   }
-  .balance-bg {
-    position: absolute; inset: 0;
-    background-image:
-      radial-gradient(circle at 80% 0%, rgba(232, 149, 108, 0.18) 0%, transparent 50%),
-      radial-gradient(circle at 0% 100%, rgba(122, 160, 149, 0.12) 0%, transparent 50%);
-    pointer-events: none;
+  @keyframes slideDown { from { transform: translateY(-8px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+
+  .search-input-wrap {
+    position: relative;
+    display: flex; align-items: center;
+    background: var(--bg-warm); border: 1px solid var(--line);
+    border-radius: var(--r-sm); padding: 0 14px;
+    transition: border-color 0.2s;
   }
+  .search-input-wrap:focus-within { border-color: var(--accent); }
+  .search-icon { color: var(--ink-mute); flex-shrink: 0; }
+  .search-input { flex: 1; border: none; outline: none; background: none; padding: 12px 10px; font-family: inherit; font-size: 14px; color: var(--ink); }
+  .search-input::placeholder { color: var(--ink-mute); }
+  .search-clear { background: none; border: none; padding: 4px; cursor: pointer; color: var(--ink-mute); display: grid; place-items: center; }
+
+  .search-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
+  .filter-chips { display: flex; gap: 6px; flex: 1; flex-wrap: wrap; }
+  .filter-chip {
+    padding: 6px 12px; border-radius: 100px;
+    background: var(--bg-warm); border: 1px solid var(--line);
+    font-family: inherit; font-size: 12px; color: var(--ink-soft);
+    cursor: pointer; transition: all 0.15s;
+  }
+  .filter-chip.active { background: var(--ink); border-color: var(--ink); color: white; }
+  .adv-toggle {
+    display: flex; align-items: center; gap: 4px;
+    padding: 6px 10px; border-radius: 100px;
+    background: var(--bg-warm); border: 1px solid var(--line);
+    font-family: inherit; font-size: 12px; color: var(--ink-soft);
+    cursor: pointer; flex-shrink: 0;
+  }
+  .adv-toggle.active { background: var(--accent); border-color: var(--accent); color: white; }
+
+  .advanced-filters {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--line-soft);
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .filter-group { }
+  .filter-label { font-size: 11px; color: var(--ink-soft); margin-bottom: 8px; letter-spacing: 0.06em; font-weight: 500; }
+
+  .filter-cat-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 6px;
+  }
+  .filter-cat-chip {
+    background: var(--bg-warm); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 4px;
+    cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 2px;
+    font-family: inherit; font-size: 11px; color: var(--ink);
+    transition: all 0.15s;
+  }
+  .filter-cat-chip:hover { border-color: var(--ink-mute); }
+  .filter-cat-chip > span:first-child { font-size: 16px; }
+
+  .filter-payer-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .filter-payer-chip {
+    background: var(--bg-warm); border: 1px solid var(--line);
+    border-radius: 100px; padding: 6px 12px;
+    font-family: inherit; font-size: 12px; color: var(--ink-soft);
+    cursor: pointer; transition: all 0.15s;
+  }
+  .filter-payer-chip.active { background: var(--accent); border-color: var(--accent); color: white; }
+
+  .filter-quick-date { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .quick-date-btn {
+    padding: 5px 10px; border-radius: 100px;
+    background: var(--bg-warm); border: 1px solid var(--line);
+    font-family: inherit; font-size: 11px; color: var(--ink-soft);
+    cursor: pointer; transition: all 0.15s;
+  }
+  .quick-date-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  .filter-date-row, .filter-amount-row { display: flex; align-items: center; gap: 8px; }
+  .filter-date-input, .filter-amount-input {
+    flex: 1; min-width: 0;
+    background: var(--bg-warm); border: 1px solid var(--line);
+    border-radius: 8px; padding: 8px 10px;
+    font-family: inherit; font-size: 13px; color: var(--ink);
+    outline: none; transition: border-color 0.2s;
+  }
+  .filter-date-input:focus, .filter-amount-input:focus { border-color: var(--accent); }
+  .filter-date-sep { font-size: 12px; color: var(--ink-mute); flex-shrink: 0; }
+
+  .search-actions {
+    display: flex; gap: 8px; margin-top: 14px;
+    padding-top: 12px; border-top: 1px solid var(--line-soft);
+    justify-content: flex-end;
+  }
+  .search-clear-btn, .search-close-btn {
+    padding: 8px 14px; border-radius: 8px;
+    font-family: inherit; font-size: 12px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .search-clear-btn {
+    background: var(--bg-warm); border: 1px solid var(--line); color: var(--red);
+  }
+  .search-close-btn {
+    background: var(--ink); border: none; color: white;
+  }
+
+  /* === SEARCH RESULT === */
+  .tab-search-result { animation: fadeIn 0.2s; }
+  .result-summary {
+    background: var(--paper); border-radius: var(--r-md);
+    padding: 16px; margin-bottom: 16px;
+    border: 1px solid var(--line-soft); box-shadow: var(--shadow-sm);
+  }
+  .result-count { font-size: 13px; color: var(--ink-soft); margin-bottom: 8px; }
+  .result-count strong { font-family: 'Noto Serif TC', serif; color: var(--accent); font-size: 16px; }
+  .result-stats { display: flex; flex-wrap: wrap; gap: 10px; }
+  .result-stat {
+    font-family: 'Noto Serif TC', serif; font-size: 13px; font-weight: 500;
+    padding: 4px 10px; border-radius: 6px;
+  }
+  .result-stat.income { color: var(--green); background: rgba(122, 160, 149, 0.1); }
+  .result-stat.expense { color: var(--red); background: rgba(184, 92, 92, 0.1); }
+  .result-stat.net { color: var(--ink); background: var(--bg-warm); }
+  .result-stat.net.neg { color: var(--red); }
+
+  /* === REST (same as before) === */
+  .balance-card { position: relative; background: linear-gradient(135deg, #2B2520 0%, #3D2F22 100%); border-radius: var(--r-lg); padding: 28px 24px; color: #F5EFE5; overflow: hidden; box-shadow: var(--shadow-md); margin-bottom: 28px; }
+  .balance-bg { position: absolute; inset: 0; background-image: radial-gradient(circle at 80% 0%, rgba(232, 149, 108, 0.18) 0%, transparent 50%), radial-gradient(circle at 0% 100%, rgba(122, 160, 149, 0.12) 0%, transparent 50%); pointer-events: none; }
   .balance-label { font-size: 12px; letter-spacing: 0.15em; color: rgba(245, 239, 229, 0.6); text-transform: uppercase; position: relative; }
   .balance-num { font-family: 'Noto Serif TC', serif; font-size: 36px; font-weight: 600; margin: 8px 0 24px; letter-spacing: -0.01em; position: relative; }
   .balance-num.neg { color: #E8956C; }
@@ -756,7 +1515,8 @@ const styles = `
   .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; padding: 0 4px; }
   .section-title { font-family: 'Noto Serif TC', serif; font-weight: 600; font-size: 15px; color: var(--ink); letter-spacing: 0.02em; }
   .section-count, .section-deco { font-size: 12px; color: var(--ink-mute); }
-  .head-action { display: flex; align-items: center; gap: 4px; background: none; border: none; color: var(--accent); font-size: 13px; cursor: pointer; font-family: inherit; font-weight: 500; }
+  .head-action { display: flex; align-items: center; gap: 4px; background: none; border: none; color: var(--accent); font-size: 13px; cursor: pointer; font-family: inherit; font-weight: 500; padding: 6px 10px; border-radius: 8px; transition: background 0.15s; }
+  .head-action:hover { background: rgba(201, 123, 63, 0.08); }
 
   .empty { background: var(--paper); border: 1px dashed var(--line); border-radius: var(--r-md); padding: 40px 20px; text-align: center; }
   .empty-mini { padding: 24px 20px; }
@@ -770,6 +1530,7 @@ const styles = `
   .txn-item:last-child { border-bottom: none; }
   .txn-item:hover { background: var(--bg-warm); }
   .txn-icon { width: 40px; height: 40px; border-radius: 11px; display: grid; place-items: center; font-size: 18px; flex-shrink: 0; }
+  .txn-icon.settle-icon { background: rgba(107, 143, 181, 0.15); color: var(--blue); }
   .txn-mid { flex: 1; min-width: 0; }
   .txn-top { font-size: 14px; color: var(--ink); font-weight: 500; margin-bottom: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .txn-cat { font-weight: 600; }
@@ -779,10 +1540,11 @@ const styles = `
   .txn-amt { font-family: 'Noto Serif TC', serif; font-weight: 600; font-size: 15px; }
   .txn-amt.expense { color: var(--ink); }
   .txn-amt.income { color: var(--green); }
+  .txn-amt.settle { color: var(--blue); font-size: 14px; }
   .txn-del { background: none; border: none; color: var(--ink-mute); cursor: pointer; padding: 6px; border-radius: 6px; opacity: 0; transition: all 0.2s; }
+  .txn-del.visible { opacity: 1; }
   .txn-item:hover .txn-del { opacity: 1; }
   .txn-del:hover { color: var(--red); background: rgba(184, 92, 92, 0.08); }
-
   @media (hover: none) { .txn-del { opacity: 0.6; } }
 
   .stats-summary { background: var(--paper); border-radius: var(--r-lg); padding: 28px 24px; margin-bottom: 24px; box-shadow: var(--shadow-sm); border: 1px solid var(--line-soft); }
@@ -809,10 +1571,10 @@ const styles = `
   .member-bal.pos { color: var(--green); }
   .member-bal.neg { color: var(--red); }
 
-  .transfer-list { background: var(--paper); border-radius: var(--r-md); overflow: hidden; box-shadow: var(--shadow-sm); }
-  .transfer-item { display: flex; align-items: center; padding: 16px 18px; gap: 12px; border-bottom: 1px solid var(--line-soft); }
-  .transfer-item:last-child { border-bottom: none; }
-  .transfer-from, .transfer-to { font-weight: 600; font-size: 14px; color: var(--ink); }
+  .transfer-list { display: flex; flex-direction: column; gap: 10px; }
+  .transfer-card { background: var(--paper); border-radius: var(--r-md); padding: 14px 16px; box-shadow: var(--shadow-sm); border: 1px solid var(--line-soft); }
+  .transfer-row { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .transfer-from, .transfer-to { font-weight: 600; font-size: 14px; }
   .transfer-from { color: var(--red); }
   .transfer-to { color: var(--green); }
   .transfer-arrow { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; }
@@ -820,25 +1582,34 @@ const styles = `
   .arrow-line::after { content: '→'; position: absolute; right: -2px; top: -10px; color: var(--green); font-size: 14px; }
   .arrow-amt { font-family: 'Noto Serif TC', serif; font-size: 12px; color: var(--ink-soft); font-weight: 500; }
 
-  .fab {
-    position: fixed; bottom: 86px; right: 50%; transform: translateX(50%);
-    width: 56px; height: 56px; border-radius: 50%;
-    background: linear-gradient(135deg, var(--accent) 0%, #B5683A 100%);
-    color: white; border: none; cursor: pointer; display: grid; place-items: center;
-    box-shadow: 0 6px 20px rgba(201, 123, 63, 0.45), 0 2px 4px rgba(78, 60, 42, 0.2);
-    z-index: 5; transition: all 0.2s;
-  }
+  .settle-btn { width: 100%; padding: 10px; border-radius: 8px; background: var(--bg-warm); border: 1px solid var(--line); color: var(--accent); font-family: inherit; font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; transition: all 0.15s; }
+  .settle-btn:hover { background: var(--accent); border-color: var(--accent); color: white; }
+  .settle-btn:active { transform: scale(0.98); }
+
+  .history-btn { width: 100%; padding: 14px; border-radius: var(--r-md); background: var(--paper); border: 1px solid var(--line-soft); color: var(--ink-soft); font-family: inherit; font-size: 13px; font-weight: 500; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: var(--shadow-sm); transition: all 0.15s; }
+  .history-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  .history-list { display: flex; flex-direction: column; gap: 8px; }
+  .history-item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; background: var(--paper); border: 1px solid var(--line-soft); border-radius: var(--r-sm); }
+  .history-icon { width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; background: rgba(107, 143, 181, 0.15); color: var(--blue); flex-shrink: 0; }
+  .history-mid { flex: 1; min-width: 0; }
+  .history-top { font-size: 14px; font-weight: 500; display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+  .history-from { color: var(--red); }
+  .history-to { color: var(--green); }
+  .history-arrow { color: var(--ink-mute); }
+  .history-meta { font-size: 11px; color: var(--ink-mute); }
+  .history-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .history-amt { font-family: 'Noto Serif TC', serif; font-weight: 600; font-size: 14px; color: var(--ink); }
+
+  .settle-hint { display: flex; align-items: center; gap: 8px; padding: 12px 14px; margin-bottom: 18px; background: rgba(107, 143, 181, 0.08); border-radius: var(--r-sm); color: var(--blue); font-size: 13px; }
+
+  .fab { position: fixed; bottom: 86px; right: 50%; transform: translateX(50%); width: 56px; height: 56px; border-radius: 50%; background: linear-gradient(135deg, var(--accent) 0%, #B5683A 100%); color: white; border: none; cursor: pointer; display: grid; place-items: center; box-shadow: 0 6px 20px rgba(201, 123, 63, 0.45), 0 2px 4px rgba(78, 60, 42, 0.2); z-index: 5; transition: all 0.2s; }
   @media (min-width: 600px) { .fab { right: calc(50% - 280px); transform: none; } }
   .fab:hover { transform: translateX(50%) scale(1.05); }
   @media (min-width: 600px) { .fab:hover { transform: scale(1.05); } }
   .fab:active { transform: translateX(50%) scale(0.95); }
 
-  .ledger-nav {
-    position: fixed; bottom: 0; left: 0; right: 0;
-    background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(12px);
-    border-top: 1px solid var(--line); display: flex; z-index: 4;
-    padding: 8px 0 calc(8px + env(safe-area-inset-bottom));
-  }
+  .ledger-nav { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(12px); border-top: 1px solid var(--line); display: flex; z-index: 4; padding: 8px 0 calc(8px + env(safe-area-inset-bottom)); }
   .nav-btn { flex: 1; background: none; border: none; padding: 10px 4px; display: flex; flex-direction: column; align-items: center; gap: 4px; color: var(--ink-mute); font-family: inherit; font-size: 11px; cursor: pointer; transition: color 0.15s; }
   .nav-btn.active { color: var(--accent); }
   .nav-btn span { font-weight: 500; letter-spacing: 0.05em; }
@@ -885,8 +1656,10 @@ const styles = `
 
   .payer-row, .share-row { display: flex; flex-wrap: wrap; gap: 8px; }
   .payer-btn, .share-btn { background: var(--paper); border: 1px solid var(--line); border-radius: 100px; padding: 8px 14px; cursor: pointer; font-family: inherit; font-size: 13px; color: var(--ink-soft); transition: all 0.15s; display: inline-flex; align-items: center; gap: 5px; }
-  .payer-btn:hover, .share-btn:hover { border-color: var(--ink-mute); }
+  .payer-btn:hover:not(:disabled), .share-btn:hover { border-color: var(--ink-mute); }
   .payer-btn.active { background: var(--ink); border-color: var(--ink); color: white; }
+  .payer-btn.active.green { background: var(--green); border-color: var(--green); color: white; }
+  .payer-btn:disabled { cursor: not-allowed; }
   .share-btn.active { background: var(--accent); border-color: var(--accent); color: white; }
   .share-hint { margin-top: 8px; font-size: 12px; color: var(--ink-soft); padding: 8px 12px; background: var(--bg-warm); border-radius: 8px; }
 
