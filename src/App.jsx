@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Plus, Trash2, RefreshCw, Home, PieChart, ArrowLeftRight, X, Check, UserPlus, Sparkles, Share2, HandCoins, History, Search, SlidersHorizontal } from 'lucide-react';
+import { Plus, Trash2, RefreshCw, Home, PieChart, ArrowLeftRight, X, Check, UserPlus, Sparkles, Share2, HandCoins, History, Search, SlidersHorizontal, ChevronLeft, ChevronRight, CalendarDays, User, ChevronDown } from 'lucide-react';
 import { loadData, saveData, subscribeToChanges, familyId } from './firebase.js';
 
 const CATEGORIES = {
@@ -49,6 +49,23 @@ const currentMonthLabel = () => {
   return `${d.getFullYear()} 年 ${d.getMonth() + 1} 月`;
 };
 
+// 月份相關工具
+const thisMonthKey = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+};
+
+const monthKeyToLabel = (key) => {
+  const [y, m] = key.split('-');
+  return `${y} 年 ${parseInt(m, 10)} 月`;
+};
+
+const shiftMonth = (key, delta) => {
+  const [y, m] = key.split('-').map(Number);
+  const d = new Date(y, m - 1 + delta, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+};
+
 // 把日期字串(YYYY-MM-DD)變成那天 00:00:00 或 23:59:59 的 ISO
 const startOfDay = (dateStr) => {
   if (!dateStr) return null;
@@ -76,6 +93,12 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [presetSettle, setPresetSettle] = useState(null);
+
+  // 目前檢視的月份(預設本月);影響首頁與統計頁的資料範圍
+  const [viewMonth, setViewMonth] = useState(thisMonthKey());
+
+  // 成員明細 Modal
+  const [memberDetailId, setMemberDetailId] = useState(null);
 
   // 搜尋條件
   const [searchKeyword, setSearchKeyword] = useState('');
@@ -140,10 +163,12 @@ export default function App() {
     await saveData(members, newTxns);
   };
 
-  const removeTxn = async (id) => {
-    const newTxns = txns.filter(t => t.id !== id);
-    setTxns(newTxns);
-    await saveData(members, newTxns);
+  const requestRemoveTxn = async (id) => {
+    if (confirm('確定要刪除這筆記錄?')) {
+      const newTxns = txns.filter(t => t.id !== id);
+      setTxns(newTxns);
+      await saveData(members, newTxns);
+    }
   };
 
   // 是否處於搜尋模式(任一條件被啟用)
@@ -236,8 +261,9 @@ export default function App() {
     return { count: filteredTxns.length, income, expense, net: income - expense };
   }, [filteredTxns]);
 
-  const thisMonth = monthKey(new Date().toISOString());
-  const monthTxns = useMemo(() => txns.filter(t => monthKey(t.date) === thisMonth), [txns, thisMonth]);
+  const thisMonth = thisMonthKey();
+  const isViewingThisMonth = viewMonth === thisMonth;
+  const monthTxns = useMemo(() => txns.filter(t => monthKey(t.date) === viewMonth), [txns, viewMonth]);
 
   const stats = useMemo(() => {
     let income = 0, expense = 0;
@@ -260,9 +286,49 @@ export default function App() {
     return { income, expense, balance: income - expense, catList };
   }, [monthTxns]);
 
+  // 依成員統計(用當月支出記錄,看每個人「付了」多少、各分類分佈)
+  const memberStats = useMemo(() => {
+    const result = members.map(m => {
+      const myTxns = monthTxns.filter(t => t.type === 'expense' && t.payerId === m.id);
+      let total = 0;
+      const catMap = {};
+      myTxns.forEach(t => {
+        const amt = Number(t.amount);
+        total += amt;
+        catMap[t.category] = (catMap[t.category] || 0) + amt;
+      });
+      const catList = Object.entries(catMap)
+        .map(([id, amt]) => {
+          const cat = CATEGORIES.expense.find(c => c.id === id);
+          return cat ? { ...cat, amount: amt } : null;
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.amount - a.amount);
+      return { ...m, total, count: myTxns.length, catList };
+    }).sort((a, b) => b.total - a.total);
+    return result;
+  }, [members, monthTxns]);
+
+  // 某個成員的月明細(給 Modal 用)
+  const memberDetail = useMemo(() => {
+    if (!memberDetailId) return null;
+    const member = members.find(m => m.id === memberDetailId);
+    if (!member) return null;
+    const stat = memberStats.find(s => s.id === memberDetailId);
+    const list = monthTxns
+      .filter(t => t.type === 'expense' && t.payerId === memberDetailId)
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
+    return { member, stat, list };
+  }, [memberDetailId, members, memberStats, monthTxns]);
+
   const settlement = useMemo(() => {
     const balances = {};
     members.forEach(m => { balances[m.id] = 0; });
+
+    // 記錄每個欠款人「欠誰、因為哪筆消費、欠多少」
+    // owesDetail[debtorId] = [{ txnId, toId, toName, catId, note, date, amount(我這筆分攤的金額) }]
+    const owesDetail = {};
+    members.forEach(m => { owesDetail[m.id] = []; });
 
     txns.forEach(t => {
       if (t.type === 'expense' && t.shareIds && t.shareIds.length > 0) {
@@ -271,6 +337,17 @@ export default function App() {
         if (balances[t.payerId] !== undefined) balances[t.payerId] += amt;
         t.shareIds.forEach(sid => {
           if (balances[sid] !== undefined) balances[sid] -= share;
+          // 分攤者 sid 對付款人 payerId 產生 share 的欠款(自己付的不算)
+          if (sid !== t.payerId && owesDetail[sid]) {
+            owesDetail[sid].push({
+              txnId: t.id,
+              toId: t.payerId,
+              catId: t.category,
+              note: t.note,
+              date: t.date,
+              amount: share,
+            });
+          }
         });
       } else if (t.type === 'settlement') {
         const amt = Number(t.amount);
@@ -299,7 +376,13 @@ export default function App() {
       const d = dCopy[i];
       const c = cCopy[j];
       const amt = Math.min(d.amount, c.amount);
-      if (amt > 0.5) transfers.push({ fromId: d.id, from: d.name, toId: c.id, to: c.name, amount: amt });
+      if (amt > 0.5) {
+        // 找出這位欠款人欠這位收款人的消費明細
+        const sources = (owesDetail[d.id] || [])
+          .filter(s => s.toId === c.id)
+          .sort((a, b) => b.amount - a.amount);
+        transfers.push({ fromId: d.id, from: d.name, toId: c.id, to: c.name, amount: amt, sources });
+      }
       d.amount -= amt;
       c.amount -= amt;
       if (d.amount < 0.5) i++;
@@ -332,9 +415,37 @@ export default function App() {
         <div className="header-inner">
           <div className="brand">
             <div className="brand-mark">家</div>
-            <div>
+            <div className="brand-text">
               <div className="brand-title">家庭記帳本</div>
-              <div className="brand-sub">{currentMonthLabel()}</div>
+              {(tab === 'home' || tab === 'stats') ? (
+                <div className="month-switcher">
+                  <button
+                    className="month-nav-btn"
+                    onClick={() => setViewMonth(shiftMonth(viewMonth, -1))}
+                    aria-label="上個月"
+                  >
+                    <ChevronLeft size={14} />
+                  </button>
+                  <button
+                    className={`month-label-btn ${!isViewingThisMonth ? 'past' : ''}`}
+                    onClick={() => setViewMonth(thisMonth)}
+                    title={isViewingThisMonth ? '本月' : '點擊回到本月'}
+                  >
+                    {monthKeyToLabel(viewMonth)}
+                    {!isViewingThisMonth && <span className="back-now"> · 回本月</span>}
+                  </button>
+                  <button
+                    className="month-nav-btn"
+                    onClick={() => setViewMonth(shiftMonth(viewMonth, 1))}
+                    disabled={isViewingThisMonth}
+                    aria-label="下個月"
+                  >
+                    <ChevronRight size={14} />
+                  </button>
+                </div>
+              ) : (
+                <div className="brand-sub">{currentMonthLabel()}</div>
+              )}
             </div>
           </div>
           <div className="header-actions">
@@ -382,15 +493,33 @@ export default function App() {
                 filteredTxns={filteredTxns}
                 searchStats={searchStats}
                 members={members}
-                onDelete={removeTxn}
+                onDelete={requestRemoveTxn}
                 onClearSearch={clearSearch}
               />
             ) : (
-              <HomeTab stats={stats} txns={txns} monthTxns={monthTxns} members={members} onDelete={removeTxn} />
+              <HomeTab
+                stats={stats}
+                txns={txns}
+                monthTxns={monthTxns}
+                members={members}
+                onDelete={requestRemoveTxn}
+                isViewingThisMonth={isViewingThisMonth}
+                viewMonth={viewMonth}
+              />
             )}
           </>
         )}
-        {tab === 'stats' && <StatsTab stats={stats} monthTxns={monthTxns} />}
+        {tab === 'stats' && (
+          <StatsTab
+            stats={stats}
+            monthTxns={monthTxns}
+            memberStats={memberStats}
+            members={members}
+            onShowMemberDetail={(id) => setMemberDetailId(id)}
+            isViewingThisMonth={isViewingThisMonth}
+            viewMonth={viewMonth}
+          />
+        )}
         {tab === 'split' && (
           <SplitTab
             members={members}
@@ -477,7 +606,15 @@ export default function App() {
           history={settlementHistory}
           members={members}
           onClose={() => setShowHistory(false)}
-          onDelete={removeTxn}
+          onDelete={requestRemoveTxn}
+        />
+      )}
+
+      {memberDetail && (
+        <MemberDetailModal
+          detail={memberDetail}
+          monthLabel={isViewingThisMonth ? '本月' : monthKeyToLabel(viewMonth)}
+          onClose={() => setMemberDetailId(null)}
         />
       )}
     </div>
@@ -645,7 +782,7 @@ function SearchPanel({
 }
 
 // 搜尋結果頁
-function SearchResultTab({ filteredTxns, searchStats, members, onDelete, onClearSearch }) {
+function SearchResultTab({ filteredTxns, searchStats, members, onDelete, onEdit, onClearSearch }) {
   return (
     <div className="tab-search-result">
       <div className="result-summary">
@@ -697,7 +834,7 @@ function SearchResultTab({ filteredTxns, searchStats, members, onDelete, onClear
                   </div>
                   <div className="txn-right">
                     <div className="txn-amt settle">↻ {formatMoney(t.amount)}</div>
-                    <button className="txn-del" onClick={() => { if (confirm('刪除這筆還款記錄?')) onDelete(t.id); }}>
+                    <button className="txn-del" onClick={() => onDelete(t.id)}>
                       <Trash2 size={14} />
                     </button>
                   </div>
@@ -726,7 +863,12 @@ function SearchResultTab({ filteredTxns, searchStats, members, onDelete, onClear
                   <div className={`txn-amt ${t.type}`}>
                     {t.type === 'income' ? '+' : '-'}{formatMoney(t.amount)}
                   </div>
-                  <button className="txn-del" onClick={() => { if (confirm('確定要刪除這筆記錄?')) onDelete(t.id); }}>
+                  {onEdit && (
+                    <button className="txn-edit" onClick={() => onEdit(t)}>
+                      <Pencil size={13} />
+                    </button>
+                  )}
+                  <button className="txn-del" onClick={() => onDelete(t.id)}>
                     <Trash2 size={14} />
                   </button>
                 </div>
@@ -768,13 +910,17 @@ function ShareModal({ onClose }) {
   );
 }
 
-function HomeTab({ stats, monthTxns, members, onDelete }) {
+function HomeTab({ stats, monthTxns, members, onDelete, onEdit, isViewingThisMonth, viewMonth }) {
   const recent = monthTxns.slice(0, 50);
+  const monthLabel = isViewingThisMonth ? '本月' : monthKeyToLabel(viewMonth);
   return (
     <div className="tab-home">
-      <div className="balance-card">
+      <div className={`balance-card ${!isViewingThisMonth ? 'past' : ''}`}>
         <div className="balance-bg" />
-        <div className="balance-label">本月結餘</div>
+        {!isViewingThisMonth && (
+          <div className="past-badge">📅 歷史月份</div>
+        )}
+        <div className="balance-label">{monthLabel}結餘</div>
         <div className={`balance-num ${stats.balance < 0 ? 'neg' : ''}`}>
           NT$ {formatMoney(stats.balance)}
         </div>
@@ -793,14 +939,14 @@ function HomeTab({ stats, monthTxns, members, onDelete }) {
 
       <div className="section">
         <div className="section-head">
-          <div className="section-title">本月記錄</div>
+          <div className="section-title">{monthLabel}記錄</div>
           <div className="section-count">{monthTxns.length} 筆</div>
         </div>
         {recent.length === 0 ? (
           <div className="empty">
-            <div className="empty-emoji">🌱</div>
-            <div className="empty-text">這個月還沒有記錄</div>
-            <div className="empty-hint">點右下角 + 開始記帳</div>
+            <div className="empty-emoji">{isViewingThisMonth ? '🌱' : '📭'}</div>
+            <div className="empty-text">{isViewingThisMonth ? '這個月還沒有記錄' : `${monthLabel}沒有記錄`}</div>
+            {isViewingThisMonth && <div className="empty-hint">點右下角 + 開始記帳</div>}
           </div>
         ) : (
           <div className="txn-list">
@@ -823,7 +969,7 @@ function HomeTab({ stats, monthTxns, members, onDelete }) {
                     </div>
                     <div className="txn-right">
                       <div className="txn-amt settle">↻ {formatMoney(t.amount)}</div>
-                      <button className="txn-del" onClick={() => { if (confirm('刪除這筆還款記錄?分帳會回到還沒還的狀態。')) onDelete(t.id); }}>
+                      <button className="txn-del" onClick={() => onDelete(t.id)}>
                         <Trash2 size={14} />
                       </button>
                     </div>
@@ -853,7 +999,12 @@ function HomeTab({ stats, monthTxns, members, onDelete }) {
                     <div className={`txn-amt ${t.type}`}>
                       {t.type === 'income' ? '+' : '-'}{formatMoney(t.amount)}
                     </div>
-                    <button className="txn-del" onClick={() => { if (confirm('確定要刪除這筆記錄?')) onDelete(t.id); }}>
+                    {onEdit && (
+                      <button className="txn-edit" onClick={() => onEdit(t)}>
+                        <Pencil size={13} />
+                      </button>
+                    )}
+                    <button className="txn-del" onClick={() => onDelete(t.id)}>
                       <Trash2 size={14} />
                     </button>
                   </div>
@@ -867,52 +1018,219 @@ function HomeTab({ stats, monthTxns, members, onDelete }) {
   );
 }
 
-function StatsTab({ stats, monthTxns }) {
+function StatsTab({ stats, monthTxns, memberStats, members, onShowMemberDetail, isViewingThisMonth, viewMonth }) {
+  const [subTab, setSubTab] = useState('category'); // 'category' or 'member'
   const totalExp = stats.expense || 1;
   const expenseCount = monthTxns.filter(t => t.type === 'expense').length;
+  const monthLabel = isViewingThisMonth ? '本月' : monthKeyToLabel(viewMonth);
+
   return (
     <div className="tab-stats">
-      <div className="stats-summary">
+      <div className={`stats-summary ${!isViewingThisMonth ? 'past' : ''}`}>
+        {!isViewingThisMonth && (
+          <div className="past-badge-mini">📅 {monthLabel}</div>
+        )}
         <div className="stats-big">
-          <div className="stats-label">本月支出</div>
+          <div className="stats-label">{monthLabel}支出</div>
           <div className="stats-num">NT$ {formatMoney(stats.expense)}</div>
           <div className="stats-meta">{expenseCount} 筆消費</div>
         </div>
       </div>
-      <div className="section">
-        <div className="section-head">
-          <div className="section-title">分類統計</div>
-        </div>
-        {stats.catList.length === 0 ? (
-          <div className="empty">
-            <div className="empty-emoji">📊</div>
-            <div className="empty-text">本月還沒有支出記錄</div>
+
+      {/* Sub-tab 切換 */}
+      <div className="subtab-bar">
+        <button
+          className={`subtab-btn ${subTab === 'category' ? 'active' : ''}`}
+          onClick={() => setSubTab('category')}
+        >
+          <PieChart size={14} />
+          依分類
+        </button>
+        <button
+          className={`subtab-btn ${subTab === 'member' ? 'active' : ''}`}
+          onClick={() => setSubTab('member')}
+        >
+          <User size={14} />
+          依成員
+        </button>
+      </div>
+
+      {subTab === 'category' && (
+        <div className="section">
+          <div className="section-head">
+            <div className="section-title">分類統計</div>
           </div>
-        ) : (
-          <div className="cat-list">
-            {stats.catList.map(c => {
-              const pct = (c.amount / totalExp) * 100;
+          {stats.catList.length === 0 ? (
+            <div className="empty">
+              <div className="empty-emoji">📊</div>
+              <div className="empty-text">{monthLabel}還沒有支出記錄</div>
+            </div>
+          ) : (
+            <div className="cat-list">
+              {stats.catList.map(c => {
+                const pct = (c.amount / totalExp) * 100;
+                return (
+                  <div key={c.id} className="cat-item">
+                    <div className="cat-row">
+                      <div className="cat-name">
+                        <span className="cat-emoji">{c.emoji}</span>
+                        <span>{c.name}</span>
+                      </div>
+                      <div className="cat-amt">
+                        <span className="cat-money">{formatMoney(c.amount)}</span>
+                        <span className="cat-pct">{pct.toFixed(0)}%</span>
+                      </div>
+                    </div>
+                    <div className="cat-bar">
+                      <div className="cat-fill" style={{ width: `${pct}%`, background: c.color }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {subTab === 'member' && (
+        <div className="section">
+          <div className="section-head">
+            <div className="section-title">成員付款統計</div>
+            <div className="section-count">點卡片看明細</div>
+          </div>
+          {members.length === 0 ? (
+            <div className="empty">
+              <div className="empty-emoji">👨‍👩‍👧</div>
+              <div className="empty-text">還沒有成員</div>
+              <div className="empty-hint">先到「分帳」頁加入家人</div>
+            </div>
+          ) : memberStats.every(s => s.total === 0) ? (
+            <div className="empty">
+              <div className="empty-emoji">💸</div>
+              <div className="empty-text">{monthLabel}還沒有人付款</div>
+            </div>
+          ) : (
+            <div className="member-stat-list">
+              {memberStats.map(s => {
+                const pct = s.total > 0 ? (s.total / totalExp) * 100 : 0;
+                return (
+                  <button
+                    key={s.id}
+                    className="member-stat-card"
+                    onClick={() => s.total > 0 && onShowMemberDetail(s.id)}
+                    disabled={s.total === 0}
+                  >
+                    <div className="member-stat-head">
+                      <div className="member-stat-avatar">{s.name.charAt(0)}</div>
+                      <div className="member-stat-info">
+                        <div className="member-stat-name">{s.name}</div>
+                        <div className="member-stat-meta">
+                          {s.total > 0 ? `${s.count} 筆 · 佔總支出 ${pct.toFixed(0)}%` : '本月沒有付款'}
+                        </div>
+                      </div>
+                      <div className="member-stat-amt">
+                        NT$ {formatMoney(s.total)}
+                      </div>
+                    </div>
+                    {s.total > 0 && (
+                      <>
+                        <div className="member-stat-bar">
+                          <div className="member-stat-fill" style={{ width: `${pct}%` }} />
+                        </div>
+                        {s.catList.length > 0 && (
+                          <div className="member-stat-cats">
+                            {s.catList.slice(0, 4).map(c => (
+                              <div key={c.id} className="member-stat-cat">
+                                <span className="msc-emoji">{c.emoji}</span>
+                                <span className="msc-name">{c.name}</span>
+                                <span className="msc-amt">{formatMoney(c.amount)}</span>
+                              </div>
+                            ))}
+                            {s.catList.length > 4 && (
+                              <div className="member-stat-cat more">
+                                +{s.catList.length - 4} 類
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// 待結算卡片(可展開看欠款來源)
+function TransferCard({ transfer, members, onSettleOne }) {
+  const [expanded, setExpanded] = useState(false);
+  const sources = transfer.sources || [];
+  // 把同一筆消費的多次分攤合併(理論上不會重複,但保險)
+  const hasSources = sources.length > 0;
+
+  return (
+    <div className="transfer-card">
+      <div className="transfer-row">
+        <div className="transfer-from">{transfer.from}</div>
+        <div className="transfer-arrow">
+          <div className="arrow-line" />
+          <div className="arrow-amt">NT$ {formatMoney(transfer.amount)}</div>
+        </div>
+        <div className="transfer-to">{transfer.to}</div>
+      </div>
+
+      {hasSources && (
+        <button className="source-toggle" onClick={() => setExpanded(!expanded)}>
+          <ChevronDown size={13} className={expanded ? 'rotated' : ''} />
+          {expanded ? '收起明細' : `看是哪些消費(${sources.length} 筆)`}
+        </button>
+      )}
+
+      {expanded && hasSources && (
+        <div className="source-list">
+          <div className="source-hint">{transfer.from} 因為這些消費而欠 {transfer.to}:</div>
+          {sources.map((s, idx) => {
+            const cat = CATEGORIES.expense.find(c => c.id === s.catId);
+            return (
+              <div key={idx} className="source-item">
+                <div className="source-icon" style={{ background: (cat?.color || '#999') + '22', color: cat?.color || '#999' }}>
+                  {cat?.emoji || '📝'}
+                </div>
+                <div className="source-mid">
+                  <div className="source-top">
+                    {cat?.name || '其他'}
+                    {s.note && <span className="txn-note"> · {s.note}</span>}
+                  </div>
+                  <div className="source-meta">{formatFullDate(s.date)}</div>
+                </div>
+                <div className="source-amt">NT$ {formatMoney(s.amount)}</div>
+              </div>
+            );
+          })}
+          {(() => {
+            const sourceTotal = sources.reduce((sum, s) => sum + s.amount, 0);
+            const diff = sourceTotal - transfer.amount;
+            if (diff > 0.5) {
               return (
-                <div key={c.id} className="cat-item">
-                  <div className="cat-row">
-                    <div className="cat-name">
-                      <span className="cat-emoji">{c.emoji}</span>
-                      <span>{c.name}</span>
-                    </div>
-                    <div className="cat-amt">
-                      <span className="cat-money">{formatMoney(c.amount)}</span>
-                      <span className="cat-pct">{pct.toFixed(0)}%</span>
-                    </div>
-                  </div>
-                  <div className="cat-bar">
-                    <div className="cat-fill" style={{ width: `${pct}%`, background: c.color }} />
-                  </div>
+                <div className="source-note">
+                  小計 NT$ {formatMoney(sourceTotal)},扣掉 {transfer.to} 也欠 {transfer.from} 的部分,實際應還 <strong>NT$ {formatMoney(transfer.amount)}</strong>
                 </div>
               );
-            })}
-          </div>
-        )}
-      </div>
+            }
+            return null;
+          })()}
+        </div>
+      )}
+
+      <button className="settle-btn" onClick={() => onSettleOne(transfer)}>
+        <HandCoins size={14} />
+        記錄已還款
+      </button>
     </div>
   );
 }
@@ -972,20 +1290,7 @@ function SplitTab({ members, settlement, settlementHistory, onAddMember, onRemov
           ) : (
             <div className="transfer-list">
               {settlement.transfers.map((t, i) => (
-                <div key={i} className="transfer-card">
-                  <div className="transfer-row">
-                    <div className="transfer-from">{t.from}</div>
-                    <div className="transfer-arrow">
-                      <div className="arrow-line" />
-                      <div className="arrow-amt">NT$ {formatMoney(t.amount)}</div>
-                    </div>
-                    <div className="transfer-to">{t.to}</div>
-                  </div>
-                  <button className="settle-btn" onClick={() => onSettleOne(t)}>
-                    <HandCoins size={14} />
-                    記錄已還款
-                  </button>
-                </div>
+                <TransferCard key={i} transfer={t} members={members} onSettleOne={onSettleOne} />
               ))}
             </div>
           )}
@@ -1005,17 +1310,47 @@ function SplitTab({ members, settlement, settlementHistory, onAddMember, onRemov
 }
 
 function SettleModal({ members, preset, onClose, onSubmit }) {
+  // 是否從待結算款項進來(有 preset 表示是)
+  const hasPreset = !!preset;
+  const presetAmount = preset?.amount ? Math.round(preset.amount) : 0;
+
   const [fromId, setFromId] = useState(preset?.fromId || members[0]?.id || '');
   const [toId, setToId] = useState(preset?.toId || members[1]?.id || members[0]?.id || '');
-  const [amount, setAmount] = useState(preset?.amount ? Math.round(preset.amount).toString() : '');
+  // 還款模式:'full'(全部結清) 或 'partial'(部分還款)
+  // 從待結算進來時預設「部分還款」,因為使用者大多想自己輸入金額
+  const [settleMode, setSettleMode] = useState(hasPreset ? 'partial' : 'partial');
+  const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
   const [date, setDate] = useState(() => new Date().toISOString().slice(0, 10));
+
+  // 切換模式時自動處理金額
+  useEffect(() => {
+    if (settleMode === 'full' && hasPreset) {
+      setAmount(presetAmount.toString());
+    } else if (settleMode === 'partial') {
+      // 切換到部分時清空,讓使用者主動輸入
+      setAmount('');
+    }
+  }, [settleMode, hasPreset, presetAmount]);
+
+  const currentAmount = Number(amount) || 0;
+  const remaining = hasPreset ? Math.max(0, presetAmount - currentAmount) : 0;
+  const isOverpay = hasPreset && currentAmount > presetAmount;
 
   const submit = () => {
     const amt = Number(amount);
     if (!amt || amt <= 0) { alert('請輸入金額'); return; }
     if (!fromId || !toId) { alert('請選擇還款人和收款人'); return; }
     if (fromId === toId) { alert('還款人和收款人不能是同一人'); return; }
+
+    // 超額還款確認
+    if (isOverpay) {
+      const extra = currentAmount - presetAmount;
+      if (!confirm(`還款金額(NT$ ${formatMoney(currentAmount)})比應還金額(NT$ ${formatMoney(presetAmount)})多出 NT$ ${formatMoney(extra)},確定要繼續嗎?\n\n(多還的部分會變成對方欠你)`)) {
+        return;
+      }
+    }
+
     onSubmit({
       type: 'settlement',
       amount: amt,
@@ -1025,6 +1360,9 @@ function SettleModal({ members, preset, onClose, onSubmit }) {
     });
   };
 
+  const fromMember = members.find(m => m.id === fromId);
+  const toMember = members.find(m => m.id === toId);
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={e => e.stopPropagation()}>
@@ -1033,43 +1371,113 @@ function SettleModal({ members, preset, onClose, onSubmit }) {
           <button className="modal-close" onClick={onClose}><X size={18} /></button>
         </div>
         <div className="modal-body">
-          <div className="settle-hint">
-            <HandCoins size={16} />
-            <span>誰把錢還給誰?這會自動更新分帳結算。</span>
-          </div>
-
-          <div className="field">
-            <label className="field-label">還款人(付錢的)</label>
-            <div className="payer-row">
-              {members.map(m => (
-                <button key={m.id} className={`payer-btn ${fromId === m.id ? 'active' : ''}`} onClick={() => setFromId(m.id)}>
-                  {m.name}
-                </button>
-              ))}
+          {/* 從待結算進來:顯示應還總額卡片 */}
+          {hasPreset && (
+            <div className="settle-summary-card">
+              <div className="settle-summary-row">
+                <div className="settle-summary-from">{fromMember?.name || '?'}</div>
+                <div className="settle-summary-arrow">→</div>
+                <div className="settle-summary-to">{toMember?.name || '?'}</div>
+              </div>
+              <div className="settle-summary-total">
+                <span className="settle-summary-label">應還總額</span>
+                <span className="settle-summary-amount">NT$ {formatMoney(presetAmount)}</span>
+              </div>
             </div>
-          </div>
+          )}
 
-          <div className="field">
-            <label className="field-label">收款人(收錢的)</label>
-            <div className="payer-row">
-              {members.map(m => (
-                <button key={m.id}
-                  className={`payer-btn ${toId === m.id ? 'active green' : ''}`}
-                  onClick={() => setToId(m.id)}
-                  disabled={m.id === fromId}
-                  style={m.id === fromId ? { opacity: 0.3 } : {}}>
-                  {m.name}
-                </button>
-              ))}
+          {!hasPreset && (
+            <div className="settle-hint">
+              <HandCoins size={16} />
+              <span>誰把錢還給誰?這會自動更新分帳結算。</span>
             </div>
-          </div>
+          )}
+
+          {/* 沒有 preset 才顯示成員選擇 */}
+          {!hasPreset && (
+            <>
+              <div className="field">
+                <label className="field-label">還款人(付錢的)</label>
+                <div className="payer-row">
+                  {members.map(m => (
+                    <button key={m.id} className={`payer-btn ${fromId === m.id ? 'active' : ''}`} onClick={() => setFromId(m.id)}>
+                      {m.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="field">
+                <label className="field-label">收款人(收錢的)</label>
+                <div className="payer-row">
+                  {members.map(m => (
+                    <button key={m.id}
+                      className={`payer-btn ${toId === m.id ? 'active green' : ''}`}
+                      onClick={() => setToId(m.id)}
+                      disabled={m.id === fromId}
+                      style={m.id === fromId ? { opacity: 0.3 } : {}}>
+                      {m.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* 還款方式選擇(只在從待結算進來時顯示) */}
+          {hasPreset && (
+            <div className="field">
+              <label className="field-label">還款方式</label>
+              <div className="settle-mode-grid">
+                <button
+                  className={`settle-mode-btn ${settleMode === 'full' ? 'active' : ''}`}
+                  onClick={() => setSettleMode('full')}
+                >
+                  <div className="settle-mode-icon">✓</div>
+                  <div className="settle-mode-title">全部結清</div>
+                  <div className="settle-mode-amount">NT$ {formatMoney(presetAmount)}</div>
+                </button>
+                <button
+                  className={`settle-mode-btn ${settleMode === 'partial' ? 'active' : ''}`}
+                  onClick={() => setSettleMode('partial')}
+                >
+                  <div className="settle-mode-icon">$</div>
+                  <div className="settle-mode-title">部分還款</div>
+                  <div className="settle-mode-amount">自行輸入</div>
+                </button>
+              </div>
+            </div>
+          )}
 
           <div className="field">
-            <label className="field-label">金額</label>
-            <div className="amount-input">
+            <label className="field-label">
+              {settleMode === 'full' ? '結清金額' : '還款金額'}
+            </label>
+            <div className={`amount-input ${isOverpay ? 'warn' : ''}`}>
               <span className="amount-prefix">NT$</span>
-              <input type="number" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0" inputMode="decimal" autoFocus={!preset} />
+              <input
+                type="number"
+                value={amount}
+                onChange={e => setAmount(e.target.value)}
+                placeholder="0"
+                inputMode="decimal"
+                autoFocus={!hasPreset || settleMode === 'partial'}
+                disabled={settleMode === 'full' && hasPreset}
+              />
             </div>
+
+            {/* 即時顯示還款後剩餘 */}
+            {hasPreset && currentAmount > 0 && (
+              <div className={`settle-preview ${isOverpay ? 'warn' : remaining === 0 ? 'done' : ''}`}>
+                {isOverpay ? (
+                  <span>⚠️ 超額還款 NT$ {formatMoney(currentAmount - presetAmount)}(對方將會欠你)</span>
+                ) : remaining === 0 ? (
+                  <span>✨ 還款後將完全結清</span>
+                ) : (
+                  <span>還款後剩餘:NT$ <strong>{formatMoney(remaining)}</strong> 未還</span>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="field">
@@ -1084,7 +1492,9 @@ function SettleModal({ members, preset, onClose, onSubmit }) {
         </div>
         <div className="modal-foot">
           <button className="btn-cancel" onClick={onClose}>取消</button>
-          <button className="btn-submit" onClick={submit}>確認還款</button>
+          <button className="btn-submit" onClick={submit}>
+            {settleMode === 'full' ? '確認結清' : '確認還款'}
+          </button>
         </div>
       </div>
     </div>
@@ -1126,7 +1536,7 @@ function HistoryModal({ history, members, onClose, onDelete }) {
                     </div>
                     <div className="history-right">
                       <div className="history-amt">NT$ {formatMoney(t.amount)}</div>
-                      <button className="txn-del visible" onClick={() => { if (confirm('刪除這筆還款記錄?分帳會回到還沒還的狀態。')) onDelete(t.id); }}>
+                      <button className="txn-del visible" onClick={() => onDelete(t.id)}>
                         <Trash2 size={14} />
                       </button>
                     </div>
@@ -1135,6 +1545,99 @@ function HistoryModal({ history, members, onClose, onDelete }) {
               })}
             </div>
           )}
+        </div>
+        <div className="modal-foot">
+          <button className="btn-submit btn-full" onClick={onClose}>關閉</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 成員月明細 Modal
+function MemberDetailModal({ detail, monthLabel, onClose }) {
+  const { member, stat, list } = detail;
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal" onClick={e => e.stopPropagation()}>
+        <div className="modal-head">
+          <div className="modal-title">
+            <span className="md-avatar">{member.name.charAt(0)}</span>
+            {member.name} · {monthLabel}付款
+          </div>
+          <button className="modal-close" onClick={onClose}><X size={18} /></button>
+        </div>
+        <div className="modal-body">
+          {/* 總額卡片 */}
+          <div className="md-summary">
+            <div className="md-summary-label">{monthLabel}共付款</div>
+            <div className="md-summary-num">NT$ {formatMoney(stat?.total || 0)}</div>
+            <div className="md-summary-meta">{stat?.count || 0} 筆消費</div>
+          </div>
+
+          {/* 分類分佈 */}
+          {stat && stat.catList.length > 0 && (
+            <div className="field">
+              <label className="field-label">分類分佈</label>
+              <div className="cat-list" style={{ boxShadow: 'none', border: '1px solid var(--line-soft)' }}>
+                {stat.catList.map(c => {
+                  const pct = (c.amount / stat.total) * 100;
+                  return (
+                    <div key={c.id} className="cat-item">
+                      <div className="cat-row">
+                        <div className="cat-name">
+                          <span className="cat-emoji">{c.emoji}</span>
+                          <span>{c.name}</span>
+                        </div>
+                        <div className="cat-amt">
+                          <span className="cat-money">{formatMoney(c.amount)}</span>
+                          <span className="cat-pct">{pct.toFixed(0)}%</span>
+                        </div>
+                      </div>
+                      <div className="cat-bar">
+                        <div className="cat-fill" style={{ width: `${pct}%`, background: c.color }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* 全部明細 */}
+          <div className="field">
+            <label className="field-label">付款明細 ({list.length} 筆)</label>
+            {list.length === 0 ? (
+              <div className="empty empty-mini">
+                <div className="empty-emoji">📭</div>
+                <div className="empty-text">沒有付款記錄</div>
+              </div>
+            ) : (
+              <div className="md-txn-list">
+                {list.map(t => {
+                  const cat = CATEGORIES.expense.find(c => c.id === t.category);
+                  return (
+                    <div key={t.id} className="md-txn-item">
+                      <div className="md-txn-icon" style={{ background: (cat?.color || '#999') + '22', color: cat?.color || '#999' }}>
+                        {cat?.emoji || '📝'}
+                      </div>
+                      <div className="md-txn-mid">
+                        <div className="md-txn-top">
+                          {cat?.name || '其他'}
+                          {t.note && <span className="txn-note"> · {t.note}</span>}
+                        </div>
+                        <div className="md-txn-meta">
+                          {formatFullDate(t.date)}
+                          {t.shareIds && t.shareIds.length > 1 && <span> · {t.shareIds.length} 人分</span>}
+                        </div>
+                      </div>
+                      <div className="md-txn-amt">NT$ {formatMoney(t.amount)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
         <div className="modal-foot">
           <button className="btn-submit btn-full" onClick={onClose}>關閉</button>
@@ -1269,6 +1772,7 @@ function AddTxnModal({ members, onClose, onSubmit, onAddMember }) {
   );
 }
 
+// 編輯記錄 Modal
 function AddMemberModal({ members, onClose, onAdd, onRemove }) {
   const [name, setName] = useState('');
   const submit = () => { if (!name.trim()) return; onAdd(name); setName(''); };
@@ -1290,6 +1794,7 @@ function AddMemberModal({ members, onClose, onAdd, onRemove }) {
               <button className="add-btn" onClick={submit}><Plus size={16} /></button>
             </div>
           </div>
+
           {members.length > 0 && (
             <div className="field">
               <label className="field-label">目前成員 ({members.length})</label>
@@ -1359,6 +1864,204 @@ const styles = `
   .brand-mark { width: 38px; height: 38px; border-radius: 11px; background: linear-gradient(135deg, var(--accent) 0%, var(--accent-soft) 100%); color: white; display: grid; place-items: center; font-family: 'Noto Serif TC', serif; font-weight: 700; font-size: 18px; box-shadow: var(--shadow-sm); }
   .brand-title { font-family: 'Noto Serif TC', serif; font-weight: 700; font-size: 16px; color: var(--ink); line-height: 1.2; }
   .brand-sub { font-size: 11px; color: var(--ink-mute); letter-spacing: 0.05em; margin-top: 2px; }
+  .brand-text { min-width: 0; }
+
+  /* === MONTH SWITCHER === */
+  .month-switcher {
+    display: flex; align-items: center; gap: 2px;
+    margin-top: 2px;
+  }
+  .month-nav-btn {
+    width: 22px; height: 22px;
+    border-radius: 6px;
+    border: none; background: transparent;
+    color: var(--ink-mute);
+    cursor: pointer;
+    display: grid; place-items: center;
+    transition: all 0.15s;
+  }
+  .month-nav-btn:hover:not(:disabled) { background: var(--bg-warm); color: var(--accent); }
+  .month-nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+  .month-label-btn {
+    background: none; border: none;
+    padding: 2px 8px;
+    font-family: inherit;
+    font-size: 11px;
+    color: var(--ink-mute);
+    letter-spacing: 0.05em;
+    cursor: pointer;
+    border-radius: 6px;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .month-label-btn:hover { color: var(--accent); background: var(--bg-warm); }
+  .month-label-btn.past { color: var(--accent); font-weight: 500; }
+  .back-now { color: var(--ink-mute); font-size: 10px; }
+
+  .past-badge {
+    position: absolute; top: 14px; right: 16px;
+    background: rgba(232, 149, 108, 0.2);
+    color: #E8956C;
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 100px;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+    z-index: 2;
+  }
+  .balance-card.past { background: linear-gradient(135deg, #3D3024 0%, #4D3D2E 100%); }
+  .past-badge-mini {
+    display: inline-block;
+    background: rgba(232, 149, 108, 0.15);
+    color: var(--accent);
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 100px;
+    letter-spacing: 0.05em;
+    font-weight: 500;
+    margin-bottom: 10px;
+  }
+  .stats-summary.past { border-color: rgba(232, 149, 108, 0.3); }
+
+  /* === SUBTAB === */
+  .subtab-bar {
+    display: flex;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    padding: 4px;
+    margin-bottom: 18px;
+    box-shadow: var(--shadow-sm);
+  }
+  .subtab-btn {
+    flex: 1; padding: 10px;
+    background: none; border: none;
+    border-radius: 8px;
+    font-family: inherit; font-size: 13px; font-weight: 500;
+    color: var(--ink-mute);
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+  }
+  .subtab-btn.active { background: var(--ink); color: white; }
+
+  /* === MEMBER STAT === */
+  .member-stat-list { display: flex; flex-direction: column; gap: 12px; }
+  .member-stat-card {
+    background: var(--paper);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--r-md);
+    padding: 16px;
+    box-shadow: var(--shadow-sm);
+    cursor: pointer;
+    text-align: left;
+    font-family: inherit;
+    transition: all 0.15s;
+    width: 100%;
+  }
+  .member-stat-card:hover:not(:disabled) {
+    border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-md);
+  }
+  .member-stat-card:disabled { cursor: default; opacity: 0.6; }
+  .member-stat-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .member-stat-avatar {
+    width: 40px; height: 40px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-soft) 100%);
+    color: white;
+    display: grid; place-items: center;
+    font-family: 'Noto Serif TC', serif;
+    font-weight: 600;
+    font-size: 16px;
+    flex-shrink: 0;
+  }
+  .member-stat-info { flex: 1; min-width: 0; }
+  .member-stat-name { font-size: 14px; font-weight: 600; color: var(--ink); margin-bottom: 2px; }
+  .member-stat-meta { font-size: 11px; color: var(--ink-mute); }
+  .member-stat-amt {
+    font-family: 'Noto Serif TC', serif;
+    font-weight: 600; font-size: 18px;
+    color: var(--ink);
+    flex-shrink: 0;
+  }
+  .member-stat-bar {
+    height: 5px;
+    background: var(--bg-warm);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  .member-stat-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: linear-gradient(to right, var(--accent), var(--accent-soft));
+    transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  .member-stat-cats { display: flex; flex-wrap: wrap; gap: 6px; }
+  .member-stat-cat {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 8px;
+    background: var(--bg-warm);
+    border-radius: 100px;
+    font-size: 11px;
+    color: var(--ink-soft);
+  }
+  .member-stat-cat.more { color: var(--ink-mute); }
+  .msc-emoji { font-size: 12px; }
+  .msc-name { font-weight: 500; }
+  .msc-amt { font-family: 'Noto Serif TC', serif; color: var(--ink); font-weight: 600; }
+
+  /* === MEMBER DETAIL MODAL === */
+  .md-avatar {
+    display: inline-grid; place-items: center;
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-soft) 100%);
+    color: white;
+    font-family: 'Noto Serif TC', serif;
+    font-weight: 600;
+    font-size: 13px;
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .md-summary {
+    background: linear-gradient(135deg, #2B2520 0%, #3D2F22 100%);
+    border-radius: var(--r-md);
+    padding: 20px;
+    margin-bottom: 18px;
+    color: #F5EFE5;
+    text-align: center;
+  }
+  .md-summary-label { font-size: 11px; color: rgba(245, 239, 229, 0.6); letter-spacing: 0.1em; margin-bottom: 6px; }
+  .md-summary-num { font-family: 'Noto Serif TC', serif; font-size: 28px; font-weight: 600; color: #F5EFE5; margin-bottom: 4px; }
+  .md-summary-meta { font-size: 12px; color: rgba(245, 239, 229, 0.6); }
+
+  .md-txn-list { display: flex; flex-direction: column; gap: 6px; }
+  .md-txn-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px;
+    background: var(--paper);
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+  }
+  .md-txn-icon {
+    width: 32px; height: 32px;
+    border-radius: 9px;
+    display: grid; place-items: center;
+    font-size: 15px;
+    flex-shrink: 0;
+  }
+  .md-txn-mid { flex: 1; min-width: 0; }
+  .md-txn-top { font-size: 13px; color: var(--ink); font-weight: 500; margin-bottom: 2px; }
+  .md-txn-meta { font-size: 11px; color: var(--ink-mute); }
+  .md-txn-amt {
+    font-family: 'Noto Serif TC', serif;
+    font-weight: 600; font-size: 14px;
+    color: var(--ink); flex-shrink: 0;
+  }
+
   .sync-btn { width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--line); background: var(--paper); color: var(--ink-soft); cursor: pointer; display: grid; place-items: center; transition: all 0.2s; position: relative; }
   .sync-btn:hover, .sync-btn.active { border-color: var(--accent); color: var(--accent); }
   .sync-btn.syncing svg { animation: spin 0.6s linear; }
@@ -1603,6 +2306,132 @@ const styles = `
 
   .settle-hint { display: flex; align-items: center; gap: 8px; padding: 12px 14px; margin-bottom: 18px; background: rgba(107, 143, 181, 0.08); border-radius: var(--r-sm); color: var(--blue); font-size: 13px; }
 
+  /* === SETTLE MODE === */
+  .settle-summary-card {
+    background: linear-gradient(135deg, #2B2520 0%, #3D2F22 100%);
+    border-radius: var(--r-md);
+    padding: 18px 20px;
+    margin-bottom: 20px;
+    color: #F5EFE5;
+    box-shadow: var(--shadow-sm);
+  }
+  .settle-summary-row {
+    display: flex; align-items: center; justify-content: center; gap: 12px;
+    margin-bottom: 14px;
+  }
+  .settle-summary-from, .settle-summary-to {
+    font-family: 'Noto Serif TC', serif;
+    font-weight: 600; font-size: 16px;
+  }
+  .settle-summary-from { color: #E8956C; }
+  .settle-summary-to { color: #9DBFB3; }
+  .settle-summary-arrow {
+    color: rgba(245, 239, 229, 0.5);
+    font-size: 18px;
+  }
+  .settle-summary-total {
+    display: flex; align-items: baseline; justify-content: space-between;
+    padding-top: 12px;
+    border-top: 1px solid rgba(245, 239, 229, 0.12);
+  }
+  .settle-summary-label {
+    font-size: 11px;
+    color: rgba(245, 239, 229, 0.6);
+    letter-spacing: 0.1em;
+  }
+  .settle-summary-amount {
+    font-family: 'Noto Serif TC', serif;
+    font-weight: 600; font-size: 22px;
+    color: #F5EFE5;
+  }
+
+  .settle-mode-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .settle-mode-btn {
+    background: var(--paper);
+    border: 2px solid var(--line);
+    border-radius: var(--r-sm);
+    padding: 14px 12px;
+    cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    font-family: inherit;
+    transition: all 0.15s;
+    text-align: center;
+  }
+  .settle-mode-btn:hover { border-color: var(--ink-mute); }
+  .settle-mode-btn.active {
+    border-color: var(--accent);
+    background: rgba(201, 123, 63, 0.06);
+  }
+  .settle-mode-icon {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: var(--bg-warm);
+    color: var(--ink-mute);
+    display: grid; place-items: center;
+    font-family: 'Noto Serif TC', serif;
+    font-weight: 700;
+    font-size: 15px;
+    margin-bottom: 2px;
+    transition: all 0.15s;
+  }
+  .settle-mode-btn.active .settle-mode-icon {
+    background: var(--accent);
+    color: white;
+  }
+  .settle-mode-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .settle-mode-amount {
+    font-family: 'Noto Serif TC', serif;
+    font-size: 12px;
+    color: var(--ink-soft);
+    font-weight: 500;
+  }
+  .settle-mode-btn.active .settle-mode-amount {
+    color: var(--accent);
+  }
+
+  .amount-input.warn { border-color: #E8956C; background: rgba(232, 149, 108, 0.04); }
+  .amount-input input:disabled {
+    color: var(--ink);
+    -webkit-text-fill-color: var(--ink);
+    opacity: 1;
+    cursor: not-allowed;
+  }
+
+  .settle-preview {
+    margin-top: 10px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    background: var(--bg-warm);
+    color: var(--ink-soft);
+    border-left: 3px solid var(--ink-mute);
+  }
+  .settle-preview strong {
+    font-family: 'Noto Serif TC', serif;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .settle-preview.done {
+    background: rgba(122, 160, 149, 0.08);
+    color: var(--green);
+    border-left-color: var(--green);
+    font-weight: 500;
+  }
+  .settle-preview.warn {
+    background: rgba(232, 149, 108, 0.08);
+    color: #B85C5C;
+    border-left-color: #E8956C;
+    font-weight: 500;
+  }
+
   .fab { position: fixed; bottom: 86px; right: 50%; transform: translateX(50%); width: 56px; height: 56px; border-radius: 50%; background: linear-gradient(135deg, var(--accent) 0%, #B5683A 100%); color: white; border: none; cursor: pointer; display: grid; place-items: center; box-shadow: 0 6px 20px rgba(201, 123, 63, 0.45), 0 2px 4px rgba(78, 60, 42, 0.2); z-index: 5; transition: all 0.2s; }
   @media (min-width: 600px) { .fab { right: calc(50% - 280px); transform: none; } }
   .fab:hover { transform: translateX(50%) scale(1.05); }
@@ -1677,4 +2506,223 @@ const styles = `
   .member-mgmt-del:hover { color: var(--red); background: rgba(184, 92, 92, 0.08); }
 
   .share-url { background: var(--paper); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 12px 14px; font-size: 12px; color: var(--ink-soft); word-break: break-all; font-family: monospace; }
+
+  /* === EDIT BUTTON === */
+  .txn-edit {
+    background: none; border: none;
+    color: var(--ink-mute);
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 6px;
+    opacity: 0;
+    transition: all 0.2s;
+  }
+  .txn-item:hover .txn-edit { opacity: 1; }
+  .txn-edit:hover { color: var(--blue); background: rgba(107, 143, 181, 0.08); }
+  @media (hover: none) { .txn-edit { opacity: 0.6; } }
+
+  /* === SOURCE (欠款來源) === */
+  .source-toggle {
+    width: 100%;
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    padding: 8px;
+    display: flex; align-items: center; justify-content: center; gap: 5px;
+    margin-bottom: 8px;
+    border-radius: 8px;
+    transition: background 0.15s;
+  }
+  .source-toggle:hover { background: rgba(201, 123, 63, 0.06); }
+  .source-toggle svg { transition: transform 0.2s; }
+  .source-toggle svg.rotated { transform: rotate(180deg); }
+  .source-note {
+    font-size: 11px;
+    color: var(--ink-soft);
+    line-height: 1.5;
+    padding: 8px 10px;
+    background: rgba(201, 123, 63, 0.06);
+    border-radius: 8px;
+    margin-top: 2px;
+  }
+  .source-note strong { color: var(--accent); font-family: 'Noto Serif TC', serif; }
+
+  .source-list {
+    background: var(--bg-warm);
+    border-radius: var(--r-sm);
+    padding: 12px;
+    margin-bottom: 10px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .source-hint {
+    font-size: 11px;
+    color: var(--ink-soft);
+    margin-bottom: 2px;
+  }
+  .source-item {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--paper);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .source-icon {
+    width: 30px; height: 30px;
+    border-radius: 8px;
+    display: grid; place-items: center;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+  .source-mid { flex: 1; min-width: 0; }
+  .source-top { font-size: 13px; color: var(--ink); font-weight: 500; }
+  .source-meta { font-size: 10px; color: var(--ink-mute); }
+  .source-amt {
+    font-family: 'Noto Serif TC', serif;
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--ink);
+    flex-shrink: 0;
+  }
+
+  /* === ADMIN / PIN SETTINGS === */
+  .member-mgmt-hint {
+    font-size: 11px;
+    color: var(--ink-mute);
+    margin-bottom: 8px;
+    line-height: 1.4;
+  }
+  .admin-tag {
+    font-size: 10px;
+    color: var(--accent);
+    margin-left: 6px;
+    font-weight: 500;
+  }
+  .admin-toggle {
+    background: var(--bg-warm);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    width: 32px; height: 32px;
+    cursor: pointer;
+    font-size: 14px;
+    display: grid; place-items: center;
+    filter: grayscale(1) opacity(0.4);
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+  .admin-toggle.active {
+    filter: none;
+    background: rgba(201, 123, 63, 0.12);
+    border-color: var(--accent);
+  }
+
+  .pin-setting-box {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: var(--r-sm);
+    padding: 14px;
+  }
+  .pin-setting-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px;
+  }
+  .pin-setting-info { flex: 1; min-width: 0; }
+  .pin-setting-title {
+    font-size: 13px; font-weight: 600; color: var(--ink);
+    display: flex; align-items: center; gap: 6px;
+    margin-bottom: 3px;
+  }
+  .pin-setting-desc { font-size: 11px; color: var(--ink-mute); line-height: 1.4; }
+  .pin-status {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 100px;
+    flex-shrink: 0;
+  }
+  .pin-status.on { background: rgba(122, 160, 149, 0.15); color: var(--green); }
+  .pin-status.off { background: var(--bg-warm); color: var(--ink-mute); }
+
+  .pin-setting-actions, .pin-setup-actions {
+    display: flex; gap: 8px; margin-top: 12px;
+  }
+  .pin-action-btn {
+    flex: 1;
+    padding: 9px;
+    border-radius: 8px;
+    background: var(--bg-warm);
+    border: 1px solid var(--line);
+    color: var(--ink-soft);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .pin-action-btn:hover { border-color: var(--ink-mute); }
+  .pin-action-btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+  .pin-action-btn.danger { color: var(--red); }
+  .pin-setup-form { margin-top: 12px; }
+
+  /* === PIN MODAL === */
+  .pin-modal { max-width: 360px; }
+  .pin-desc {
+    text-align: center;
+    font-size: 13px;
+    color: var(--ink-soft);
+    margin-bottom: 20px;
+    line-height: 1.5;
+  }
+  .pin-dots {
+    display: flex; justify-content: center; gap: 14px;
+    margin-bottom: 16px;
+  }
+  .pin-dots.error { animation: shake 0.4s; }
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-8px); }
+    75% { transform: translateX(8px); }
+  }
+  .pin-dot {
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--line);
+    background: transparent;
+    transition: all 0.15s;
+  }
+  .pin-dot.filled {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+  .pin-error {
+    text-align: center;
+    color: var(--red);
+    font-size: 12px;
+    margin-bottom: 14px;
+  }
+  .pin-pad {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    max-width: 260px;
+    margin: 8px auto 0;
+  }
+  .pin-key {
+    aspect-ratio: 1.4;
+    border-radius: var(--r-sm);
+    border: 1px solid var(--line);
+    background: var(--paper);
+    font-family: 'Noto Serif TC', serif;
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--ink);
+    cursor: pointer;
+    transition: all 0.1s;
+  }
+  .pin-key:hover { background: var(--bg-warm); border-color: var(--accent); }
+  .pin-key:active { transform: scale(0.95); background: var(--accent); color: white; }
+  .pin-key.empty { border: none; background: none; cursor: default; }
+  .pin-key.back { font-size: 18px; color: var(--ink-soft); }
 `;
+
